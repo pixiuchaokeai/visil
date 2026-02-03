@@ -46,23 +46,38 @@ def find_file_path(file_path):
 
 def center_crop(frame, desired_size):
     """安全的中心裁剪函数，处理空数组"""
-    if frame.size == 0 or len(frame.shape) < 3:
-        warnings.warn(f"无法裁剪空帧或形状异常: {frame.shape}")
-        if len(frame.shape) == 4:  # 批处理
-            return np.zeros((frame.shape[0], desired_size, desired_size, 3), dtype=np.uint8)
-        else:  # 单帧
-            return np.zeros((desired_size, desired_size, 3), dtype=np.uint8)
+    if frame.size == 0:
+        warnings.warn(f"无法裁剪空帧")
+        return np.zeros((1, desired_size, desired_size, 3), dtype=np.uint8)
 
+    # 确保是 4D 数组 [T, H, W, C]
     if frame.ndim == 3:
-        old_size = frame.shape[:2]
+        frame = np.expand_dims(frame, axis=0)
+
+    # 现在统一按 4D 处理
+    if frame.ndim == 4:
+        old_size = frame.shape[1:3]  # (H, W)
         top = int(np.maximum(0, (old_size[0] - desired_size) / 2))
         left = int(np.maximum(0, (old_size[1] - desired_size) / 2))
-        return frame[top: top + desired_size, left: left + desired_size, :]
-    else:
-        old_size = frame.shape[1:3]
-        top = int(np.maximum(0, (old_size[0] - desired_size) / 2))
-        left = int(np.maximum(0, (old_size[1] - desired_size) / 2))
-        return frame[:, top: top + desired_size, left: left + desired_size, :]
+
+        # 确保不超出边界
+        top = min(top, max(0, frame.shape[1] - desired_size))
+        left = min(left, max(0, frame.shape[2] - desired_size))
+
+        cropped = frame[:, top: top + desired_size, left: left + desired_size, :]
+
+        # 如果裁剪后尺寸不对，进行resize
+        if cropped.shape[1] != desired_size or cropped.shape[2] != desired_size:
+            # 使用OpenCV逐帧resize
+            resized_frames = []
+            for f in cropped:
+                resized = cv2.resize(f, (desired_size, desired_size), interpolation=cv2.INTER_CUBIC)
+                resized_frames.append(resized)
+            cropped = np.array(resized_frames)
+
+        return cropped
+
+    return frame
 
 
 def resize_frame(frame, desired_size):
@@ -100,6 +115,10 @@ def load_video(video_path, all_frames=False, fps=1, cc_size=224, rs_size=256, ma
         try:
             frames = _load_video_internal(actual_path, all_frames, fps, cc_size, rs_size)
             if frames.size > 0:
+                # 最终验证维度
+                if len(frames.shape) != 4 or frames.shape[-1] != 3:
+                    warnings.warn(f"视频 {actual_path} 维度异常: {frames.shape}")
+                    return np.array([])
                 return frames
             else:
                 warnings.warn(f"第{attempt + 1}次尝试: 视频 {actual_path} 返回空数组")
@@ -155,10 +174,6 @@ def _load_video_internal(video_path, all_frames=False, fps=1, cc_size=224, rs_si
                 consecutive_errors += 1
                 if consecutive_errors >= max_consecutive_errors:
                     warnings.warn(f"连续读取失败，停止读取视频 - {video_path}")
-                    # 在预处理后的位置添加
-                    print(f"Frame shape: {frame.shape}")  # 应该是 (3, 224, 224) 或 (batch, 3, 224, 224)
-                    print(f"Frame dtype: {frame.dtype}")
-                    print(f"Frame device: {frame.device}")
                     break
                 continue
 
@@ -190,8 +205,19 @@ def _load_video_internal(video_path, all_frames=False, fps=1, cc_size=224, rs_si
 
     try:
         frames = np.array(frames)
+
+        # 确保是 4D 数组 [T, H, W, C]
+        if frames.ndim == 3:
+            frames = np.expand_dims(frames, axis=0)
+
         if cc_size is not None:
             frames = center_crop(frames, cc_size)
+
+        # 最终验证：必须是4D且通道在最后
+        if len(frames.shape) != 4 or frames.shape[-1] != 3:
+            warnings.warn(f"处理后的帧数组维度异常: {frames.shape}，期望 (T, H, W, 3)")
+            return np.array([])
+
         return frames
     except Exception as e:
         warnings.warn(f"处理帧数组时出错 - {video_path}, 错误: {e}")

@@ -115,10 +115,31 @@ class VideoGenerator(Dataset):
                 empty_video = torch.zeros((1, 3, self.cc_size, self.cc_size), dtype=torch.float32)
                 return empty_video, video_id
 
+            # 验证维度 - 必须是4D [T, H, W, C]
+            if len(video.shape) != 4 or video.shape[-1] != 3:
+                warnings.warn(f"视频 {video_id} 维度异常: {video.shape}，期望 (T, H, W, 3)")
+                self.failed_videos.append(video_id)
+                empty_video = torch.zeros((1, 3, self.cc_size, self.cc_size), dtype=torch.float32)
+                return empty_video, video_id
+
+            # 验证空间维度是否正确
+            if video.shape[1] != self.cc_size or video.shape[2] != self.cc_size:
+                warnings.warn(f"视频 {video_id} 空间维度错误: ({video.shape[1]}, {video.shape[2]})，期望 ({self.cc_size}, {self.cc_size})")
+                self.failed_videos.append(video_id)
+                empty_video = torch.zeros((1, 3, self.cc_size, self.cc_size), dtype=torch.float32)
+                return empty_video, video_id
+
             # 将numpy数组转换为PyTorch张量
-            # 注意: utils.load_video返回的形状是[T, H, W, C]
+            # utils.load_video返回的形状是[T, H, W, C]
             # 需要转换为[T, C, H, W]
             video = torch.from_numpy(video).permute(0, 3, 1, 2).float()
+
+            # 最终验证
+            if video.shape[1] != 3 or video.shape[2] != self.cc_size or video.shape[3] != self.cc_size:
+                warnings.warn(f"转换后视频 {video_id} 维度异常: {video.shape}")
+                self.failed_videos.append(video_id)
+                empty_video = torch.zeros((1, 3, self.cc_size, self.cc_size), dtype=torch.float32)
+                return empty_video, video_id
 
             return video, video_id
 
@@ -204,8 +225,30 @@ class DatasetGenerator(Dataset):
                 empty_video = torch.zeros((1, 3, self.cc_size, self.cc_size), dtype=torch.float32)
                 return empty_video, video_id
 
+            # 验证维度 - 必须是4D [T, H, W, C]
+            if len(video.shape) != 4 or video.shape[-1] != 3:
+                warnings.warn(f"视频 {video_id} 维度异常: {video.shape}，期望 (T, H, W, 3)")
+                self.failed_videos.append(video_id)
+                empty_video = torch.zeros((1, 3, self.cc_size, self.cc_size), dtype=torch.float32)
+                return empty_video, video_id
+
+            # 验证空间维度是否正确
+            if video.shape[1] != self.cc_size or video.shape[2] != self.cc_size:
+                warnings.warn(f"视频 {video_id} 空间维度错误: ({video.shape[1]}, {video.shape[2]})，期望 ({self.cc_size}, {self.cc_size})")
+                self.failed_videos.append(video_id)
+                empty_video = torch.zeros((1, 3, self.cc_size, self.cc_size), dtype=torch.float32)
+                return empty_video, video_id
+
             # 转换为PyTorch张量
             video = torch.from_numpy(video).permute(0, 3, 1, 2).float()
+
+            # 最终验证
+            if video.shape[1] != 3 or video.shape[2] != self.cc_size or video.shape[3] != self.cc_size:
+                warnings.warn(f"转换后视频 {video_id} 维度异常: {video.shape}")
+                self.failed_videos.append(video_id)
+                empty_video = torch.zeros((1, 3, self.cc_size, self.cc_size), dtype=torch.float32)
+                return empty_video, video_id
+
             return video, video_id
 
         except Exception as e:
