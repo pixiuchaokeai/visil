@@ -14,8 +14,32 @@ class VideoNormalizer(nn.Module):
         self.std = nn.Parameter(torch.Tensor([0.229, 0.224, 0.225]), requires_grad=False)
 
     def forward(self, video):
+        # 确保视频形状正确
+        if video.dim() == 4:
+            # [N, H, W, C] 或 [N, C, H, W]
+            if video.shape[1] == 3:
+                # [N, C, H, W] -> [N, H, W, C]
+                video = video.permute(0, 2, 3, 1)
+            elif video.shape[3] == 3:
+                # 已经是 [N, H, W, C]，保持不动
+                pass
+            else:
+                raise ValueError(f"Unsupported video shape: {video.shape}")
+        elif video.dim() == 3:
+            # [H, W, C] 或 [C, H, W]
+            if video.shape[0] == 3:
+                # [C, H, W] -> [H, W, C]
+                video = video.permute(1, 2, 0)
+                video = video.unsqueeze(0)  # 添加批次维度
+            elif video.shape[2] == 3:
+                # [H, W, C] -> [1, H, W, C]
+                video = video.unsqueeze(0)
+            else:
+                raise ValueError(f"Unsupported video shape: {video.shape}")
+
+        # 现在视频应该是 [N, H, W, C] 格式，其中 C=3
         video = ((video / self.scale) - self.mean) / self.std
-        return video.permute(0, 3, 1, 2)
+        return video.permute(0, 3, 1, 2)  # [N, C, H, W]
 
 
 class RMAC(nn.Module):
