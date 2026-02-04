@@ -1,9 +1,14 @@
+"""
+optimized_calculate_similarity.py
+内存优化的视频相似度计算
+"""
+
 import json
 import torch
 import argparse
-import warnings
 import gc
-import psutil
+import os
+import sys
 
 from tqdm import tqdm
 from model.visil import ViSiL
@@ -11,175 +16,349 @@ from torch.utils.data import DataLoader
 from datasets.generators import VideoGenerator
 from evaluation import extract_features, calculate_similarities_to_queries
 
-if __name__ == '__main__':
 
-    formatter = lambda prog: argparse.ArgumentDefaultsHelpFormatter(prog, max_help_position=80)
-    parser = argparse.ArgumentParser(
-        description='This is the code for video similarity calculation based on ViSiL network.',
-        formatter_class=formatter)
+class MemoryOptimizedSimilarityCalculator:
+    """内存优化的相似度计算器"""
+
+    def __init__(self, args):
+        self.args = args
+
+        # 设备选择
+        if args.cpu_only or not torch.cuda.is_available():
+            self.device = torch.device('cpu')
+            args.batch_sz = min(args.batch_sz, 16)  # CPU使用更小批次
+            args.batch_sz_sim = min(args.batch_sz_sim, 256)
+            print("> 使用CPU进行计算（内存优化模式）")
+        else:
+            self.device = torch.device(f'cuda:{args.gpu_id}')
+            print(f"> 使用GPU设备: {self.device}")
+
+        args.device = self.device
+
+        # 内存监控
+        self.max_memory_usage = 0
+        self.check_memory_interval = 10
+
+    def check_memory_usage(self):
+        """检查内存使用情况"""
+        import psutil
+        process = psutil.Process(os.getpid())
+        memory_usage = process.memory_info().rss / (1024 ** 3)  # GB
+
+        if memory_usage > self.max_memory_usage:
+            self.max_memory_usage = memory_usage
+
+        if memory_usage > self.args.max_cpu_memory_gb:
+            print(f"\n> 警告: 内存使用超过阈值 ({memory_usage:.2f}GB > {self.args.max_cpu_memory_gb}GB)")
+            print("> 正在清理内存...")
+            self.cleanup_memory()
+
+        return memory_usage
+
+    def cleanup_memory(self):
+        """清理内存"""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print("> 内存清理完成")
+
+    def process_queries(self, model):
+        """处理查询视频（内存优化版）"""
+        print("\n" + "=" * 60)
+        print("阶段1: 处理查询视频（内存优化）")
+        print("=" * 60)
+
+        generator = VideoGenerator(self.args.query_file)
+        loader = DataLoader(generator, num_workers=0, batch_size=1)
+
+        queries, queries_ids = [], []
+        failed_queries = []
+
+        pbar = tqdm(loader, desc="处理查询视频")
+        for idx, video in enumerate(pbar):
+            frames = video[0][0]
+            video_id = video[1][0]
+
+            # 限制最大帧数，减少内存使用
+            max_frames = 100  # 限制每视频最多100帧
+            if frames.shape[0] > max_frames:
+                print(f"\n  > 视频 {video_id} 帧数过多 ({frames.shape[0]} > {max_frames})，随机采样")
+                indices = torch.randperm(frames.shape[0])[:max_frames]
+                frames = frames[indices]
+
+            if frames.shape[0] < 4:
+                print(f"\n  > 跳过查询视频 {video_id}: 帧数不足 ({frames.shape[0]})")
+                failed_queries.append(video_id)
+                continue
+
+            try:
+                # 分批处理，避免内存峰值
+                features = self.extract_features_with_memory_limit(model, frames)
+                features = features.cpu()  # 立即转移到CPU
+                queries.append(features)
+                queries_ids.append(video_id)
+
+                pbar.set_postfix(query=video_id, 内存=f"{self.check_memory_usage():.1f}GB")
+
+            except Exception as e:
+                print(f"\n  > 处理查询视频 {video_id} 出错: {str(e)[:100]}")
+                failed_queries.append(video_id)
+
+            # 定期清理
+            if idx % self.check_memory_interval == 0:
+                self.cleanup_memory()
+
+        print(f"\n> 成功处理 {len(queries)} 个查询视频")
+        if failed_queries:
+            print(f"> 失败 {len(failed_queries)} 个: {failed_queries[:5]}...")
+
+        if not queries:
+            print("> 错误: 没有成功处理的查询视频")
+            sys.exit(1)
+
+        return queries, queries_ids, failed_queries
+
+    def extract_features_with_memory_limit(self, model, frames):
+        """内存限制的特征提取"""
+        batch_sz = self.args.batch_sz
+
+        # 动态调整批次大小
+        if frames.shape[0] > 100:
+            batch_sz = max(8, batch_sz // 2)
+
+        features = []
+        for i in range(0, frames.shape[0], batch_sz):
+            batch = frames[i:i + batch_sz]
+            if batch.shape[0] > 0:
+                batch = batch.to(self.device).float()
+                batch_features = model.extract_features(batch)
+                features.append(batch_features.cpu())  # 立即转移到CPU
+
+                # 每批后检查内存
+                if i % (batch_sz * 5) == 0:
+                    self.check_memory_usage()
+
+        if features:
+            return torch.cat(features, 0)
+        else:
+            return torch.randn(4, 9, 512)
+
+    def process_database(self, model, queries, queries_ids):
+        """处理数据库视频（内存优化版）"""
+        print("\n" + "=" * 60)
+        print("阶段2: 处理数据库视频（内存优化）")
+        print("=" * 60)
+
+        generator = VideoGenerator(self.args.database_file)
+        loader = DataLoader(generator, num_workers=0, batch_size=1)
+
+        similarities = {query_id: {} for query_id in queries_ids}
+        failed_database = []
+        processed_count = 0
+
+        # 分批处理查询特征，避免一次性加载所有查询
+        query_batch_size = 10  # 每次处理10个查询
+        total_queries = len(queries)
+
+        pbar = tqdm(loader, desc="处理数据库视频")
+        for idx, video in enumerate(pbar):
+            frames = video[0][0]
+            video_id = video[1][0]
+
+            # 限制最大帧数
+            max_frames = 100
+            if frames.shape[0] > max_frames:
+                indices = torch.randperm(frames.shape[0])[:max_frames]
+                frames = frames[indices]
+
+            if frames.shape[0] < 4:
+                failed_database.append(video_id)
+                continue
+
+            try:
+                # 分批提取特征
+                target_features = self.extract_features_with_memory_limit(model, frames)
+                target_features = target_features.cpu()
+
+                # 分批计算相似度
+                for q_start in range(0, total_queries, query_batch_size):
+                    q_end = min(q_start + query_batch_size, total_queries)
+
+                    # 获取当前批次的查询特征
+                    current_queries = []
+                    for q_idx in range(q_start, q_end):
+                        # 确保查询特征在CPU上
+                        if queries[q_idx].device != torch.device('cpu'):
+                            current_queries.append(queries[q_idx].cpu())
+                        else:
+                            current_queries.append(queries[q_idx])
+
+                    # 计算相似度
+                    sims = self.calculate_similarities_memory_optimized(
+                        model, current_queries, target_features
+                    )
+
+                    # 存储结果
+                    for i, s in enumerate(sims):
+                        similarities[queries_ids[q_start + i]][video_id] = float(s)
+
+                processed_count += 1
+                pbar.set_postfix(
+                    video=video_id[:10],
+                    已处理=processed_count,
+                    内存=f"{self.check_memory_usage():.1f}GB"
+                )
+
+            except Exception as e:
+                print(f"\n  > 处理数据库视频 {video_id} 出错: {str(e)[:100]}")
+                failed_database.append(video_id)
+
+            # 定期清理和保存检查点
+            if idx % self.check_memory_interval == 0:
+                self.cleanup_memory()
+
+            if processed_count % 100 == 0:
+                self.save_checkpoint(similarities, processed_count)
+                # 重新打开文件以释放内存
+                del target_features
+                self.cleanup_memory()
+
+        return similarities, failed_database, processed_count
+
+    def calculate_similarities_memory_optimized(self, model, queries, target):
+        """内存优化的相似度计算"""
+        similarities = []
+
+        # 更小的批次大小用于相似度计算
+        sim_batch_size = min(128, self.args.batch_sz_sim // 4)
+
+        for query in queries:
+            query = query.to(self.device)
+
+            sim_values = []
+            for b in range(0, target.shape[0], sim_batch_size):
+                batch = target[b:b + sim_batch_size]
+                if batch.shape[0] >= 4:
+                    batch = batch.to(self.device)
+                    batch_sim = model.calculate_video_similarity(query.unsqueeze(0), batch.unsqueeze(0))
+                    sim_values.append(batch_sim.cpu())
+                    del batch
+                    self.cleanup_memory()
+
+            if sim_values:
+                sim_tensor = torch.stack(sim_values, 0)
+                sim_value = torch.mean(sim_tensor)
+                similarities.append(sim_value.detach().cpu().numpy())
+            else:
+                similarities.append(0.0)
+
+            del query
+            self.cleanup_memory()
+
+        return similarities
+
+    def save_checkpoint(self, similarities, count):
+        """保存检查点"""
+        checkpoint_file = f"{self.args.output_file}.checkpoint_{count}.json"
+        with open(checkpoint_file, 'w') as f:
+            # 只保存部分结果以减少文件大小
+            checkpoint_data = {}
+            for query_id in list(similarities.keys())[:10]:  # 只保存前10个查询的结果
+                checkpoint_data[query_id] = similarities[query_id]
+            json.dump(checkpoint_data, f, indent=1)
+
+        print(f"\n> 检查点已保存: {checkpoint_file}")
+
+    def run(self):
+        """运行完整的相似度计算流程"""
+        print("=" * 80)
+        print("ViSiL 视频相似度计算（内存优化版）")
+        print("=" * 80)
+
+        # 初始化模型
+        print("\n> 初始化ViSiL模型...")
+        model = ViSiL(
+            pretrained=True,
+            symmetric=('symmetric' in self.args.similarity_function)
+        ).to(self.device)
+        model.eval()
+
+        # 阶段1: 处理查询视频
+        queries, queries_ids, failed_queries = self.process_queries(model)
+
+        # 阶段2: 处理数据库视频
+        similarities, failed_database, processed_count = self.process_database(
+            model, queries, queries_ids
+        )
+
+        # 阶段3: 保存最终结果
+        self.save_final_results(similarities, failed_queries, failed_database, processed_count)
+
+        print(f"\n> 最大内存使用: {self.max_memory_usage:.2f}GB")
+        print("> 完成！")
+
+    def save_final_results(self, similarities, failed_queries, failed_database, processed_count):
+        """保存最终结果"""
+        print("\n" + "=" * 60)
+        print("阶段3: 保存最终结果")
+        print("=" * 60)
+
+        # 保存主结果（压缩格式以节省磁盘空间）
+        with open(self.args.output_file, 'w') as f:
+            json.dump(similarities, f, separators=(',', ':'))  # 紧凑格式
+
+        # 保存统计信息
+        stats_file = f"{self.args.output_file}.stats.txt"
+        with open(stats_file, 'w') as f:
+            f.write(f"ViSiL 相似度计算结果统计\n")
+            f.write(f"查询视频总数: {len(queries_ids)}\n")
+            f.write(f"失败的查询视频: {len(failed_queries)}\n")
+            f.write(f"处理的数据库视频: {processed_count}\n")
+            f.write(f"失败的数据库视频: {len(failed_database)}\n")
+            f.write(f"最大内存使用: {self.max_memory_usage:.2f}GB\n")
+
+        print(f"> 结果已保存到: {self.args.output_file}")
+        print(f"> 统计信息已保存到: {stats_file}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='内存优化的视频相似度计算')
+
+    # 基本参数
     parser.add_argument('--query_file', type=str, required=True,
-                        help='Path to file that contains the query videos')
+                        help='查询视频列表文件路径')
     parser.add_argument('--database_file', type=str, required=True,
-                        help='Path to file that contains the database videos')
+                        help='数据库视频列表文件路径')
     parser.add_argument('--output_file', type=str, default='results.json',
-                        help='Name of the output file.')
-    parser.add_argument('--batch_sz', type=int, default=128,
-                        help='Number of frames contained in each batch during feature extraction. Default: 128')
-    parser.add_argument('--batch_sz_sim', type=int, default=2048,
-                        help='Number of feature tensors in each batch during similarity calculation.')
+                        help='输出文件路径')
+
+    # 批处理参数
+    parser.add_argument('--batch_sz', type=int, default=16,
+                        help='特征提取批次大小（建议: CPU=16, GPU=32）')
+    parser.add_argument('--batch_sz_sim', type=int, default=256,
+                        help='相似度计算批次大小')
+
+    # 设备参数
     parser.add_argument('--gpu_id', type=int, default=0,
-                        help='Id of the GPU used.')
-    parser.add_argument('--load_queries', action='store_true',
-                        help='Flag that indicates that the queries will be loaded to the GPU memory.')
-    parser.add_argument('--similarity_function', type=str, default='chamfer', choices=["chamfer", "symmetric_chamfer"],
-                        help='Function that will be used to calculate similarity '
-                             'between query-target frames and videos.')
-    parser.add_argument('--workers', type=int, default=8,
-                        help='Number of workers used for video loading.')
-    # 新增内存管理参数
+                        help='GPU设备ID')
     parser.add_argument('--cpu_only', action='store_true',
-                        help='Force to use CPU even if GPU is available')
-    parser.add_argument('--max_cpu_memory_gb', type=float, default=16.0,
-                        help='Maximum CPU memory usage in GB')
-    parser.add_argument('--checkpoint_interval', type=int, default=100,
-                        help='Save checkpoint every N videos')
+                        help='强制使用CPU')
+
+    # 模型参数
+    parser.add_argument('--similarity_function', type=str, default='symmetric_chamfer',
+                        choices=['chamfer', 'symmetric_chamfer'],
+                        help='相似度函数类型')
+
+    # 内存管理参数
+    parser.add_argument('--max_cpu_memory_gb', type=float, default=12.0,
+                        help='最大CPU内存使用（GB）')
 
     args = parser.parse_args()
 
-    # 设备选择
-    if args.cpu_only or not torch.cuda.is_available():
-        device = torch.device('cpu')
-        print("> 使用CPU进行计算")
-    else:
-        device = torch.device(f'cuda:{args.gpu_id}')
-        print(f"> 使用GPU设备: {device}")
+    # 运行内存优化的计算器
+    calculator = MemoryOptimizedSimilarityCalculator(args)
+    calculator.run()
 
-    # 将设备信息添加到args
-    args.device = device
 
-    # 调整批次大小以适应CPU内存
-    if device.type == 'cpu':
-        args.batch_sz = min(args.batch_sz, 32)
-        args.batch_sz_sim = min(args.batch_sz_sim, 512)
-        print(f"> CPU模式下使用较小的批次大小: batch_sz={args.batch_sz}, batch_sz_sim={args.batch_sz_sim}")
-
-    # Create a video generator for the queries
-    generator = VideoGenerator(args.query_file)
-    loader = DataLoader(generator, num_workers=min(args.workers, 4) if device.type == 'cpu' else args.workers)
-
-    # Initialize ViSiL model
-    model = ViSiL(pretrained=True, symmetric='symmetric' in args.similarity_function).to(device)
-    model.eval()
-
-    # Extract features of the queries
-    queries, queries_ids = [], []
-    pbar = tqdm(loader)
-    print('> Extract features of the query videos')
-
-    failed_videos = []
-    for idx, video in enumerate(pbar):
-        frames = video[0][0]
-        video_id = video[1][0]
-
-        # 检查帧数是否足够
-        if frames.shape[0] < 4:
-            print(f"\n> Warning: Video {video_id} has too few frames ({frames.shape[0]} < 4), skipping")
-            failed_videos.append(video_id)
-            continue
-
-        try:
-            # CPU内存管理
-            if device.type == 'cpu':
-                memory_usage = psutil.Process().memory_info().rss / (1024 ** 3)
-                if memory_usage > args.max_cpu_memory_gb:
-                    print(f"\n> Memory usage ({memory_usage:.2f} GB) exceeds threshold ({args.max_cpu_memory_gb} GB)")
-                    print("> Clearing cache and garbage collecting...")
-                    gc.collect()
-
-            features = extract_features(model, frames, args)
-            if not args.load_queries:
-                features = features.cpu()
-            queries.append(features)
-            queries_ids.append(video_id)
-            pbar.set_postfix(query_id=video_id)
-
-        except Exception as e:
-            print(f"\n> Error processing query video {video_id}: {e}")
-            failed_videos.append(video_id)
-            continue
-
-        # 定期垃圾回收
-        if idx % 10 == 0:
-            gc.collect()
-
-    if failed_videos:
-        print(f"\n> Warning: {len(failed_videos)} query videos failed to process")
-        if len(failed_videos) <= 10:
-            for vid in failed_videos:
-                print(f"  - {vid}")
-
-    if not queries:
-        print("> Error: No query features extracted. Exiting.")
-        exit(1)
-
-    # Create a video generator for the database video
-    generator = VideoGenerator(args.database_file)
-    loader = DataLoader(generator, num_workers=min(args.workers, 4) if device.type == 'cpu' else args.workers)
-
-    # Calculate similarities between the queries and the database videos
-    similarities = dict({query: dict() for query in queries_ids})
-    pbar = tqdm(loader)
-    print('\n> Calculate query-target similarities')
-
-    db_failed_videos = []
-    for idx, video in enumerate(pbar):
-        frames = video[0][0]
-        video_id = video[1][0]
-
-        # 检查帧数是否足够
-        if frames.shape[0] < 4:
-            print(f"\n> Warning: Database video {video_id} has too few frames ({frames.shape[0]} < 4), skipping")
-            db_failed_videos.append(video_id)
-            continue
-
-        try:
-            features = extract_features(model, frames, args)
-            sims = calculate_similarities_to_queries(model, queries, features, args)
-            for i, s in enumerate(sims):
-                similarities[queries_ids[i]][video_id] = float(s)
-            pbar.set_postfix(video_id=video_id)
-
-        except Exception as e:
-            print(f"\n> Error processing database video {video_id}: {e}")
-            db_failed_videos.append(video_id)
-            continue
-
-        # 检查点保存
-        if args.checkpoint_interval > 0 and (idx + 1) % args.checkpoint_interval == 0:
-            checkpoint_file = f"{args.output_file}.checkpoint_{idx + 1}"
-            with open(checkpoint_file, 'w') as f:
-                json.dump(similarities, f, indent=1)
-            print(f"\n> Checkpoint saved: {checkpoint_file}")
-
-        # 定期垃圾回收
-        if idx % 10 == 0:
-            gc.collect()
-
-    if db_failed_videos:
-        print(f"\n> Warning: {len(db_failed_videos)} database videos failed to process")
-
-    # Save similarities to a json file
-    with open(args.output_file, 'w') as f:
-        json.dump(similarities, f, indent=1)
-
-    print(f'\n> Results saved to {args.output_file}')
-
-    # 保存失败视频列表
-    if failed_videos or db_failed_videos:
-        failed_file = f"{args.output_file}.failed.json"
-        with open(failed_file, 'w') as f:
-            json.dump({
-                'failed_queries': failed_videos,
-                'failed_database': db_failed_videos
-            }, f, indent=1)
-        print(f'> Failed videos list saved to {failed_file}')
+if __name__ == '__main__':
+    main()

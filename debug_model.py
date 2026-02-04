@@ -274,10 +274,12 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='调试版的视频相似度计算，只处理少量视频并打印维度信息', formatter_class=formatter)
 
     # ===== 输入输出文件参数 =====
-    parser.add_argument('--query_file', type=str, required=True,
-                        help='包含查询视频列表的文件路径（文本格式，每行：视频ID 视频路径）')
-    parser.add_argument('--database_file', type=str, required=True,
-                        help='包含数据库视频列表的文件路径（文本格式，每行：视频ID 视频路径）')
+    parser.add_argument('--query_file', type=str,
+                        default='datasets/fivr-5k-queries-filtered.txt',
+                        help='包含查询视频列表的文件路径（文本格式，每行：视频ID 视频路径），默认：datasets/fivr-5k-queries-filtered.txt')
+    parser.add_argument('--database_file', type=str,
+                        default='datasets/fivr-5k-database-filtered.txt',
+                        help='包含数据库视频列表的文件路径（文本格式，每行：视频ID 视频路径），默认：datasets/fivr-5k-database-filtered.txt')
     parser.add_argument('--output_file', type=str, default='debug_results.json',
                         help='输出文件名，保存查询视频与数据库视频的相似度结果（JSON格式）')
 
