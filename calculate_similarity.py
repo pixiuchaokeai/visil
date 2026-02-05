@@ -40,7 +40,7 @@ class ImmediateSaver:
         args.device = self.device
 
         # 创建输出目录
-        self.output_dir = "immediate_output"
+        self.output_dir = "output"
         os.makedirs(self.output_dir, exist_ok=True)
 
         # 创建帧存储目录
@@ -708,7 +708,7 @@ class ImmediateSaver:
             f.write(f"失败的查询视频: {len(query_failed)}\n\n")
             f.write(f"数据库视频总数: {len(database_ids) + len(database_failed)}\n")
             f.write(f"成功提取数据库视频: {len(database_ids)}\n")
-            f.write(f"失败的数据库视频: {len(database_failed)}\n\n")
+            f.write(f"失败的据库视频: {len(database_failed)}\n\n")
             f.write(f"帧数据目录: {self.frames_dir} (npy格式)\n")
             f.write(f"特征数据目录: {self.features_dir} (npy格式)\n")
             f.write(f"相似度结果: {result_file}\n")
