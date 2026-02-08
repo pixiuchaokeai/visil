@@ -69,7 +69,7 @@ class ImmediateSaver:
             memory_usage = process.memory_info().rss / (1024 ** 3)  # GB
 
             if memory_usage > self.memory_warning_threshold:
-                print(f"\n⚠️ 内存使用过高: {memory_usage:.2f}GB > {self.memory_warning_threshold}GB")
+                print(f"\n[警告] 内存使用过高: {memory_usage:.2f}GB > {self.memory_warning_threshold}GB")
                 return True
         except:
             pass

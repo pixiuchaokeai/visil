@@ -183,7 +183,7 @@ def main():
                         help='帧文件目录 (默认: output/frames)')
     parser.add_argument('--features_dir', type=str, default='output/features',
                         help='特征文件目录 (默认: output/features)')
-    parser.add_argument('--output_dir', type=str, default='evaluation_output',
+    parser.add_argument('--output_dir', type=str, default='output',
                         help='输出目录 (默认: evaluation_output)')
 
     args = parser.parse_args()

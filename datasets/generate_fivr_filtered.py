@@ -102,19 +102,52 @@ def filter_fivr_pickle(original_pickle_path, query_list_path, database_list_path
         print(f"错误: original_database 类型不是集合: {type(original_database)}")
         return
 
-    # 6. 筛选annotation数据
+    # 6. 筛选annotation数据 - 修复版本
     print(f"\n筛选annotation数据...")
 
     original_annotation = fivr_data.get('annotation', {})
     print(f"原始annotation数量: {len(original_annotation)}")
 
-    # 只保留过滤后的查询视频的annotation
+    # 重新构建annotation：只保留过滤后的查询视频的annotation
     filtered_annotation = {}
-    for video_id, annotation_data in original_annotation.items():
-        if video_id in query_video_ids:
-            filtered_annotation[video_id] = annotation_data
 
-    print(f"筛选后annotation数量: {len(filtered_annotation)}")
+    for query_id in query_video_ids:
+        if query_id in original_annotation:
+            query_annotation = original_annotation[query_id]
+
+            if isinstance(query_annotation, dict):
+                # 创建新的查询标注
+                new_query_annotation = {}
+
+                for label_type, related_videos in query_annotation.items():
+                    if isinstance(related_videos, list):
+                        # 只保留在过滤数据库中的相关视频
+                        filtered_related = [vid for vid in related_videos if vid in database_video_ids]
+                        if filtered_related:  # 只添加非空列表
+                            new_query_annotation[label_type] = filtered_related
+
+                if new_query_annotation:  # 只添加有相关视频的查询
+                    filtered_annotation[query_id] = new_query_annotation
+
+                    # 打印第一个查询的信息
+                    if len(filtered_annotation) == 1:
+                        print(f"示例查询 {query_id} 的标注:")
+                        for label_type, videos in new_query_annotation.items():
+                            print(f"  {label_type}: {len(videos)} 个相关视频")
+                            if videos:
+                                print(f"    示例: {videos[:3]}")
+            else:
+                print(f"警告: 查询 {query_id} 的标注类型不是字典: {type(query_annotation)}")
+
+    print(f"筛选后annotation数量: {len(filtered_annotation)} 个查询视频")
+
+    # 统计总相关视频数
+    total_related_videos = 0
+    for query_id, annotation in filtered_annotation.items():
+        for label_type, videos in annotation.items():
+            total_related_videos += len(videos)
+
+    print(f"总相关视频数: {total_related_videos}")
 
     # 7. 创建新的数据结构
     print(f"\n创建新的数据结构...")
@@ -153,20 +186,32 @@ def filter_fivr_pickle(original_pickle_path, query_list_path, database_list_path
     print(f"数据库视频数量: {len(loaded_database)}")
     print(f"annotation数量: {len(loaded_annotation)}")
 
-    # 检查是否有遗漏
-    loaded_query_ids = set(loaded_queries)
-    missing_queries = query_video_ids - loaded_query_ids
-
-    if missing_queries:
-        print(f"\n注意: 有 {len(missing_queries)} 个查询视频在过滤列表中但不在原始标注中")
-        print(f"示例: {list(missing_queries)[:5]}")
-
     # 检查annotation中的查询视频是否都在查询列表中
     annotation_query_ids = set(loaded_annotation.keys())
+    loaded_query_ids = set(loaded_queries)
+
+    print(f"annotation中的查询视频: {len(annotation_query_ids)}")
+    print(f"查询列表中的视频: {len(loaded_query_ids)}")
+
     if annotation_query_ids != loaded_query_ids:
         print(f"\n注意: annotation中的查询视频与查询列表不匹配")
-        print(f"annotation中有但查询列表没有: {annotation_query_ids - loaded_query_ids}")
-        print(f"查询列表有但annotation中没有: {loaded_query_ids - annotation_query_ids}")
+        missing_in_annotation = loaded_query_ids - annotation_query_ids
+        missing_in_queries = annotation_query_ids - loaded_query_ids
+
+        if missing_in_annotation:
+            print(f"查询列表有但annotation中没有 ({len(missing_in_annotation)}): {list(missing_in_annotation)[:5]}")
+        if missing_in_queries:
+            print(f"annotation中有但查询列表没有 ({len(missing_in_queries)}): {list(missing_in_queries)[:5]}")
+    else:
+        print("✓ annotation与查询列表匹配")
+
+    # 统计每个查询的相关视频
+    print(f"\n每个查询的相关视频统计:")
+    for query_id in list(loaded_annotation.keys())[:3]:  # 只显示前3个
+        annotation = loaded_annotation[query_id]
+        print(f"查询 {query_id}:")
+        for label_type, videos in annotation.items():
+            print(f"  {label_type}: {len(videos)} 个相关视频")
 
     return filtered_data
 

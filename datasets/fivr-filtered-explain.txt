@@ -1,0 +1,150 @@
+D:\xtCode\MachineLearning\Anaconda3\envs\PVCD\python.exe "E:\graduation project\visil-pytorch2\datasets\generate_fivr_filtered.py"
+所有文件都存在，开始处理...
+原始pickle文件: fivr.pickle
+查询列表文件: fivr-5k-queries-filtered.txt
+数据库列表文件: fivr-5k-database-filtered.txt
+输出文件: fivr-filtered.pickle
+
+首先探索原始pickle文件结构...
+
+探索文件: fivr.pickle
+==================================================
+root: 字典 (长度: 3)
+  [0] 键: 5k (<class 'str'>)
+    键 '5k' 的值: 字典 (长度: 2)
+      [0] 键: queries (<class 'str'>)
+        键 'queries' 的值: 列表 (长度: 50)
+          第一个元素类型: <class 'str'>
+            第一个元素: str: 8ja0i5wV-io...
+      [1] 键: database (<class 'str'>)
+        键 'database' 的值: 集合 (长度: 5000)
+          [0] 元素: QgMBJNHVw8Q (<class 'str'>)
+          [1] 元素: gPx3raxJ_9c (<class 'str'>)
+          [2] 元素: xpQDgqp4muA (<class 'str'>)
+          ... 还有 4997 个元素
+  [1] 键: 200k (<class 'str'>)
+    键 '200k' 的值: 字典 (长度: 2)
+      [0] 键: queries (<class 'str'>)
+        键 'queries' 的值: 列表 (长度: 100)
+          第一个元素类型: <class 'str'>
+            第一个元素: str: wrC_Uqk3juY...
+      [1] 键: database (<class 'str'>)
+        键 'database' 的值: 集合 (长度: 225960)
+          [0] 元素: kO5ysc0NMWM (<class 'str'>)
+          [1] 元素: giYhupTsHEc (<class 'str'>)
+          [2] 元素: M9UB1Etm1VU (<class 'str'>)
+          ... 还有 225957 个元素
+  [2] 键: annotation (<class 'str'>)
+    键 'annotation' 的值: 字典 (长度: 100)
+      [0] 键: ytHe8aJyjfk (<class 'str'>)
+        键 'ytHe8aJyjfk' 的值: 字典 (长度: 2)
+          [0] 键: ND (<class 'str'>)
+            键 'ND' 的值: 列表 (长度: 134)
+              第一个元素类型: <class 'str'>
+                第一个元素: str: LVxS6tgHRus...
+          [1] 键: DS (<class 'str'>)
+            键 'DS' 的值: 列表 (长度: 103)
+              第一个元素类型: <class 'str'>
+                第一个元素: str: E_YKe_zDpOg...
+      [1] 键: QXNIyKLfbJ4 (<class 'str'>)
+        键 'QXNIyKLfbJ4' 的值: 字典 (长度: 5)
+          [0] 键: ND (<class 'str'>)
+            键 'ND' 的值: 列表 (长度: 138)
+              第一个元素类型: <class 'str'>
+                第一个元素: str: W6SWUnH6RD4...
+          [1] 键: DA (<class 'str'>)
+            键 'DA' 的值: 列表 (长度: 385)
+              第一个元素类型: <class 'str'>
+                第一个元素: str: W6SWUnH6RD4...
+          [2] 键: DS (<class 'str'>)
+            键 'DS' 的值: 列表 (长度: 303)
+              第一个元素类型: <class 'str'>
+                第一个元素: str: 542APUmsWuw...
+          ... 还有 2 个键
+      [2] 键: aoNInMCfVYw (<class 'str'>)
+        键 'aoNInMCfVYw' 的值: 字典 (长度: 5)
+          [0] 键: ND (<class 'str'>)
+            键 'ND' 的值: 列表 (长度: 39)
+              第一个元素类型: <class 'str'>
+                第一个元素: str: yzfaOhHB7As...
+          [1] 键: DA (<class 'str'>)
+            键 'DA' 的值: 列表 (长度: 209)
+              第一个元素类型: <class 'str'>
+                第一个元素: str: yzfaOhHB7As...
+          [2] 键: DS (<class 'str'>)
+            键 'DS' 的值: 列表 (长度: 211)
+              第一个元素类型: <class 'str'>
+                第一个元素: str: f2dHcS7XuU0...
+          ... 还有 2 个键
+      ... 还有 97 个键
+==================================================
+正在加载原始pickle文件: fivr.pickle
+原始数据结构:
+类型: <class 'dict'>
+字典长度: 3
+键: ['5k', '200k', 'annotation']
+
+'5k'子字典结构:
+键: ['queries', 'database']
+
+数据类型:
+original_queries 类型: <class 'list'>, 长度: 50
+original_database 类型: <class 'set'>, 长度: 5000
+
+正在读取查询视频列表: fivr-5k-queries-filtered.txt
+读取到 29 个查询视频ID
+
+正在读取数据库视频列表: fivr-5k-database-filtered.txt
+读取到 3234 个数据库视频ID
+
+筛选查询视频数据...
+原始查询视频数量: 50
+筛选后查询视频数量: 29
+
+筛选数据库视频数据...
+原始数据库视频数量: 5000
+筛选后数据库视频数量: 3234
+
+筛选annotation数据...
+原始annotation数量: 100
+示例查询 k_NT43aJ_Jw 的标注:
+  DS: 51 个相关视频
+    示例: ['QUPkDU63jz8', 'HvwHwq4L0cY', 'YuLQthnvQdI']
+  ND: 10 个相关视频
+    示例: ['-KuR8y1gjJQ', 'I1A8TQVG51o', 'EMVD9zlY1no']
+  CS: 48 个相关视频
+    示例: ['YuLQthnvQdI', 'fNbH5vLhdzI', 'nIGvcAzpvUM']
+筛选后annotation数量: 29 个查询视频
+总相关视频数: 1415
+
+创建新的数据结构...
+
+保存到新的pickle文件: fivr-filtered.pickle
+完成!
+
+验证保存的文件...
+验证结果:
+查询视频数量: 29
+数据库视频数量: 3234
+annotation数量: 29
+annotation中的查询视频: 29
+查询列表中的视频: 29
+✓ annotation与查询列表匹配
+
+每个查询的相关视频统计:
+查询 k_NT43aJ_Jw:
+  DS: 51 个相关视频
+  ND: 10 个相关视频
+  CS: 48 个相关视频
+查询 2n30dbPBNKE:
+  ND: 2 个相关视频
+  DA: 6 个相关视频
+  DS: 8 个相关视频
+  IS: 2 个相关视频
+查询 6at-OEesGXc:
+  ND: 2 个相关视频
+  DA: 6 个相关视频
+  DS: 6 个相关视频
+  IS: 2 个相关视频
+
+进程已结束，退出代码为 0
