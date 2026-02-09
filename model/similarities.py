@@ -37,7 +37,7 @@ class ChamferSimilarity(nn.Module):
     def symmetric_chamfer_similarity(self, s, axes=[0, 1]):
         return (self.chamfer_similarity(s, max_axis=axes[0], mean_axis=axes[1]) +
                 self.chamfer_similarity(s, max_axis=axes[1], mean_axis=axes[0])) / 2
-    
+
     def forward(self, s):
         return self.sim_fun(s)
 
@@ -48,6 +48,7 @@ class VideoComperator(nn.Module):
         super(VideoComperator, self).__init__()
         self.rpad1 = nn.ReplicationPad2d(1)
         self.conv1 = nn.Conv2d(1, 32, 3)
+
         self.pool1 = nn.MaxPool2d((2, 2), 2)
 
         self.rpad2 = nn.ReplicationPad2d(1)

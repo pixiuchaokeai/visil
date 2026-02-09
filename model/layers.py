@@ -151,6 +151,8 @@ class Attention(nn.Module):
             weights = self.context_vector(x_tr)
             weights = torch.sigmoid(weights)
         x = x * weights
+        # 新增：直接重新归一化
+        x = F.normalize(x, p=2, dim=-1)
         return x, weights
 
     def reset_parameters(self):

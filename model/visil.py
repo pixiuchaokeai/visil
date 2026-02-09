@@ -116,6 +116,10 @@ class Feature_Extractor(nn.Module):
         
         # L2归一化
         x = F.normalize(x, p=2, dim=-1)
+
+        # 验证归一化是否正确
+        norms = torch.norm(x, dim=-1)
+        print(f"> 特征归一化检查: 平均范数={norms.mean():.4f}, 最小范数={norms.min():.4f}, 最大范数={norms.max():.4f}")
         
         return x
 
@@ -129,6 +133,8 @@ class Feature_Extractor(nn.Module):
         # 应用PCA白化（如果启用）
         if self.pca is not None:
             x = self.pca(x)
+            # 新增：PCA白化后需要重新归一化
+            x = F.normalize(x, p=2, dim=-1)
 
         if x.shape[-1] != self.output_dim:
             print(f"> 警告: 特征维度不匹配! 期望: {self.output_dim}, 实际: {x.shape[-1]}")
@@ -137,6 +143,14 @@ class Feature_Extractor(nn.Module):
             if not hasattr(self, 'projection'):
                 self.projection = nn.Linear(x.shape[-1], self.output_dim).to(x.device)
             x = self.projection(x)
+            #  新增 ：投影后再次归一化
+            x = F.normalize(x, p=2, dim=-1)
+
+        # 最终验证
+        final_norm = torch.norm(x, dim=-1).mean()
+        if abs(final_norm - 1.0) > 0.01:
+            # 强制归一化
+            x = F.normalize(x, p=2, dim=-1)
 
         return x
 
@@ -166,7 +180,8 @@ class ViSiLHead(nn.Module):
         self.tensor_dot = TensorDot(pattern="biok,bjpk->biopj", metric='cosine')
         
         # Chamfer相似度
-        self.f2f_sim = ChamferSimilarity(symmetric=False, axes=[3, 2])  # 帧到帧
+        # self.f2f_sim = ChamferSimilarity(symmetric=False, axes=[3, 2])  # 帧到帧
+        self.f2f_sim = ChamferSimilarity(symmetric=False, axes=[4, 2])  # 帧到帧
         self.v2v_sim = ChamferSimilarity(symmetric=symmetric, axes=[2, 1])  # 视频到视频
         
         # Hardtanh将相似度限制在[-1, 1]范围内
@@ -199,18 +214,30 @@ class ViSiLHead(nn.Module):
 
     def video_to_video_similarity(self, query, target):
         """计算视频到视频相似度"""
+        # 检查并确保特征归一化
+        query_norm = torch.norm(query, dim=-1).mean()
+        target_norm = torch.norm(target, dim=-1).mean()
+
+        if abs(query_norm - 1.0) > 0.1 or abs(target_norm - 1.0) > 0.1:
+            # 强制归一化
+            query = F.normalize(query, p=2, dim=-1)
+            target = F.normalize(target, p=2, dim=-1)
+
         # 计算帧到帧相似度矩阵
         sim = self.frame_to_frame_similarity(query, target)  # [B, query_frames, target_frames]
-        
+
         # 如果有视频比较器，则应用
         if self.video_comperator is not None:
+            print(f"  应用视频比较器...")
             sim = self.visil_output(sim)
-            
-            # 应用Hardtanh限制范围
+            # print(f"  视频比较器输出统计: 平均={sim.mean():.4f}, 最小={sim.min():.4f}, 最大={sim.max():.4f}")
+
             sim = self.htanh(sim)
-        
+            # print(f"  Hardtanh后统计: 平均={sim.mean():.4f}, 最小={sim.min():.4f}, 最大={sim.max():.4f}")
+
         # 计算最终的视频相似度
-        result = self.v2v_sim(sim)  # [B] 或标量
+        result = self.v2v_sim(sim)
+        print(f"  最终相似度: {result}")
         
         return result
 
