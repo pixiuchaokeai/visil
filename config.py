@@ -1,154 +1,187 @@
-# -*- coding: utf-8 -*-
+# config.py - 配置管理（新增默认实验列表，支持灵活选择）
 """
-config.py
-统一的配置管理文件
+ViSiL实验配置管理
+修复点1: 新增 DEFAULT_ABLATION_EXPERIMENTS，仅包含需要的消融模型
+修复点2: 保留完整配置供用户自定义
 """
 
+import json
 import os
-from dataclasses import dataclass
-from typing import Dict, List, Optional
+from dataclasses import dataclass, asdict, field
+from typing import List, Dict, Any, Optional
+import torch
+import hashlib
 
 
 @dataclass
-class ExperimentConfig:
-    """实验配置类"""
+class FeatureExtractionConfig:
+    """特征提取配置 - 专注L2/L3-iMAC"""
+    name: str = "L3-iMAC9x"
+    network: str = "resnet50"
+    feature_dim: int = 3840
+    regions: int = 9
+    level: int = 3
+    use_pca: bool = False
+    use_attention: bool = False
+    use_video_comparator: bool = False
+    symmetric: bool = False
 
-    # 目录配置
-    output_dir: str = "reproduce_results"
-    frames_dir: str = "output/frames"
-    features_dir: str = "output/features"
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+    def get_hash(self) -> str:
+        config_str = json.dumps(self.to_dict(), sort_keys=True)
+        return hashlib.md5(config_str.encode()).hexdigest()[:12]
+
+
+@dataclass
+class EvaluationConfig:
+    """评估配置 - 统一参数"""
+    dataset: str = "FIVR-5K"
     video_dir: str = "datasets/FIVR-200K"
     video_pattern: str = "{id}.mp4"
+    feature_config: FeatureExtractionConfig = field(default_factory=FeatureExtractionConfig)
 
-    # FIVR-5K配置 - 使用过滤后的29个查询
-    fivr5k_queries: int = 29  # 你的过滤列表中有29个查询
-    fivr5k_database_size: int = 3234  # 过滤后的数据库大小
+    max_frames: int = 50
+    batch_size: int = 4
+    feature_batch_size: int = 16
+    query_batch_size: int = 10
+    num_workers: int = 1
 
-    # 论文结果配置
-    paper_results: Dict = None
+    video_size: int = 224
+    video_fps: int = 1
+
+    gpu_id: int = 0
+    cpu_only: bool = False
+
+    base_output_dir: str = "output"
+    experiment_id: str = "default_experiment"
+    clear_cache: bool = False
 
     def __post_init__(self):
-        """初始化后的处理"""
-        os.makedirs(self.output_dir, exist_ok=True)
+        if self.experiment_id == "default_experiment":
+            import time
+            timestamp = str(int(time.time()))[-6:]
+            self.experiment_id = f"{self.feature_config.name}_{timestamp}"
+
+        # 目录结构
+        self.frames_dir = os.path.join(self.base_output_dir, "frames")
+        feature_name = self.feature_config.name
+        if feature_name == "L2-iMAC4x":
+            feature_dir_name = "l2_imac"
+        elif feature_name == "L3-iMAC9x":
+            feature_dir_name = "ViSiL_f"
+        else:
+            feature_dir_name = feature_name.replace("_", "").lower()
+        self.features_dir = os.path.join(self.base_output_dir, "features1", feature_dir_name)
+        self.output_dir = os.path.join(self.base_output_dir, "results", self.experiment_id)
+
         os.makedirs(self.frames_dir, exist_ok=True)
         os.makedirs(self.features_dir, exist_ok=True)
+        os.makedirs(self.output_dir, exist_ok=True)
 
-        # 初始化论文结果
-        if self.paper_results is None:
-            self.paper_results = self.load_paper_results()
-
-    def load_paper_results(self) -> Dict:
-        """加载论文结果"""
-        return {
-            # 表2: Feature Extraction Comparison
-            "table2": {
-                "MAC": {"DSVR": 0.747, "CSVR": 0.730, "ISVR": 0.684},
-                "SPoC": {"DSVR": 0.735, "CSVR": 0.722, "ISVR": 0.669},
-                "R-MAC": {"DSVR": 0.777, "CSVR": 0.764, "ISVR": 0.707},
-                "GeM": {"DSVR": 0.776, "CSVR": 0.768, "ISVR": 0.711},
-                "iMAC": {"DSVR": 0.755, "CSVR": 0.749, "ISVR": 0.689},
-                "L2-iMAC4x": {"DSVR": 0.814, "CSVR": 0.810, "ISVR": 0.738},
-                "L3-iMAC9x": {"DSVR": 0.838, "CSVR": 0.832, "ISVR": 0.739},
-            },
-            # 表3: Ablation Study
-            "table3": {
-                "ViSiLf": {"DSVR": 0.838, "CSVR": 0.832, "ISVR": 0.739},
-                "ViSiLf+W": {"DSVR": 0.844, "CSVR": 0.837, "ISVR": 0.750},
-                "ViSiLf+W+A": {"DSVR": 0.856, "CSVR": 0.848, "ISVR": 0.768},
-                "ViSiLsym": {"DSVR": 0.830, "CSVR": 0.823, "ISVR": 0.731},
-                "ViSiLv": {"DSVR": 0.880, "CSVR": 0.869, "ISVR": 0.777},
-            },
-            # 表4: Regularization Impact
-            "table4": {
-                "without_reg": {"DSVR": 0.859, "CSVR": 0.842, "ISVR": 0.756},
-                "with_reg": {"DSVR": 0.880, "CSVR": 0.869, "ISVR": 0.777},
-            },
-            # 表6: FIVR-200K Results
-            "table6": {
-                "ViSiLf": {"DSVR": 0.843, "CSVR": 0.797, "ISVR": 0.660},
-                "ViSiLsym": {"DSVR": 0.833, "CSVR": 0.792, "ISVR": 0.654},
-                "ViSiLv": {"DSVR": 0.892, "CSVR": 0.841, "ISVR": 0.702},
-            }
-        }
-
-
-@dataclass
-class ModelConfig:
-    """模型配置类"""
-
-    # 模型选择
-    model_type: str = "ViSiLv"  # ViSiLf, ViSiLsym, ViSiLv
-
-    # 根据论文表3，修正配置
-    # ViSiLf: L3-iMAC9x 特征
-    # ViSiLsym: L3-iMAC9x + 对称
-    # ViSiLv: L3-iMAC9x + 白化 + 注意力 + 视频比较器
-
-    # 修正：根据模型类型设置正确的配置
-    @property
-    def symmetric(self) -> bool:
-        """对称性：仅ViSiLsym使用"""
-        return self.model_type.lower() == "visilsym"
-
-    @property
-    def whiteninig(self) -> bool:
-        """白化：ViSiLf+W, ViSiLf+W+A, ViSiLsym, ViSiLv使用"""
-        return self.model_type.lower() in ["visilf+w", "visilf+w+a", "visilsym", "visilv"]
-
-    @property
-    def attention(self) -> bool:
-        """注意力：ViSiLf+W+A, ViSiLsym, ViSiLv使用"""
-        return self.model_type.lower() in ["visilf+w+a", "visilsym", "visilv"]
-
-    @property
-    def video_comperator(self) -> bool:
-        """视频比较器：仅ViSiLv使用"""
-        return self.model_type.lower() == "visilv"
-
-    @property
-    def feature_dim(self) -> int:
-        """特征维度：3840维（L3-iMAC9x），512维是PCA降维后的"""
-        if self.pretrained:
-            return 512  # 预训练模型使用PCA降维到512维
+        if self.cpu_only or not torch.cuda.is_available():
+            self.device = torch.device('cpu')
+            self.feature_batch_size = min(self.feature_batch_size, 8)
+            self.num_workers = min(self.num_workers, 2)
         else:
-            return 3840  # 原始L3-iMAC9x维度
+            self.device = torch.device(f'cuda:{self.gpu_id}')
+            self.feature_batch_size = min(self.feature_batch_size, 32)
 
-    # 其他固定配置
-    pretrained: bool = True
-    network: str = "resnet50"
+        print(f"> 实验配置初始化:")
+        print(f"  实验ID: {self.experiment_id}")
+        print(f"  特征配置: {self.feature_config.name}")
+        print(f"  特征目录: {self.features_dir}")
+        print(f"  特征批次大小: {self.feature_batch_size}")
+        print(f"  并行数: {self.num_workers}")
 
-    # 设备配置
-    gpu_id: int = 0
-    batch_size: int = 32
-    query_batch_size: int = 5
+    def to_dict(self) -> Dict:
+        config_dict = asdict(self)
+        config_dict['feature_config'] = self.feature_config.to_dict()
+        config_dict['device'] = str(self.device)
+        config_dict['frames_dir'] = self.frames_dir
+        config_dict['features_dir'] = self.features_dir
+        config_dict['output_dir'] = self.output_dir
+        return config_dict
 
-
-@dataclass
-class DatasetConfig:
-    """数据集配置类"""
-
-    name: str = "FIVR-5K"
-    queries_file: str = "datasets/fivr-5k-queries-filtered.txt"  # 使用过滤后的查询文件
-    database_file: str = "datasets/fivr-5k-database-filtered.txt"  # 使用过滤后的数据库文件
-    annotations_file: str = "datasets/fivr-filtered.pickle"  # 使用生成的pickle标注文件
-
-    # 论文设置：使用完整的数据库视频进行评估
-    evaluation_size: int = 3234  # 过滤后的数据库大小
-
-    # 任务定义
-    tasks: Dict = None
-
-    def __post_init__(self):
-        """初始化任务定义"""
-        if self.tasks is None:
-            self.tasks = {
-                "DSVR": ["ND", "DS"],  # Duplicate Scene Video Retrieval
-                "CSVR": ["ND", "DS", "CS"],  # Complementary Scene Video Retrieval
-                "ISVR": ["ND", "DS", "CS", "IS"],  # Incident Scene Video Retrieval
-            }
+    def save(self, filepath: str):
+        with open(filepath, 'w') as f:
+            json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
 
 
-# 全局配置实例
-experiment_config = ExperimentConfig()
-model_config = ModelConfig()
-dataset_config = DatasetConfig()
+# ==================== 修复点1：特征比较实验配置 ====================
+FEATURE_CONFIGS = {
+    "L3-iMAC9x": FeatureExtractionConfig(
+        name="L3-iMAC9x",
+        network="resnet50",
+        feature_dim=3840,
+        regions=9,
+        level=3,
+        use_pca=False,
+        use_attention=False,
+        use_video_comparator=False,
+        symmetric=False
+    )
+}
+
+# ==================== 修复点2：消融实验配置（保留完整，但默认仅运行部分）====================
+ABLATION_CONFIGS = {
+    "visil_v": FeatureExtractionConfig(
+        name="visil_v",
+        network="resnet50",
+        feature_dim=3840,
+        regions=9,
+        level=3,
+        use_pca=True,
+        use_attention=True,
+        use_video_comparator=True,
+        symmetric=False
+    ),
+    "visil_f_w_a": FeatureExtractionConfig(
+        name="visil_f_w_a",
+        network="resnet50",
+        feature_dim=3840,
+        regions=9,
+        level=3,
+        use_pca=True,
+        use_attention=True,
+        use_video_comparator=False,
+        symmetric=False
+    ),
+    "visil_f_w": FeatureExtractionConfig(
+        name="visil_f_w",
+        network="resnet50",
+        feature_dim=3840,
+        regions=9,
+        level=3,
+        use_pca=True,
+        use_attention=False,
+        use_video_comparator=False,
+        symmetric=False
+    ),
+    "visil_f": FeatureExtractionConfig(
+        name="visil_f",
+        network="resnet50",
+        feature_dim=3840,
+        regions=9,
+        level=3,
+        use_pca=False,
+        use_attention=False,
+        use_video_comparator=False,
+        symmetric=False
+    ),
+    "visil_sym": FeatureExtractionConfig(
+        name="visil_sym",
+        network="resnet50",
+        feature_dim=3840,
+        regions=9,
+        level=3,
+        use_pca=True,
+        use_attention=True,
+        use_video_comparator=True,
+        symmetric=True
+    )
+}
+
+# ==================== 修复点3：默认运行的消融实验列表 ====================
+EXPERIMENT_PHASES = ["visil_v", "visil_f_w_a", "visil_f_w"]

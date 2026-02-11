@@ -1,318 +1,366 @@
-# -*- coding: utf-8 -*-
+# ablation_study.py - 消融实验（修复参数传递）
 """
-ablation_study.py
-消融实验脚本（修复编码问题版本）
-对应论文表3和表4
+ViSiL模型消融实验 - 修复参数传递
+修复点：确保使用正确的参数名称
+修复点：按照论文顺序运行实验
 """
 
 import os
 import json
-import numpy as np
+import time
+import random
 from datetime import datetime
-from typing import Dict, List
-import sys
+from tqdm import tqdm
 
-# 设置系统编码为UTF-8
-sys.stdout.reconfigure(encoding='utf-8') if hasattr(sys.stdout, 'reconfigure') else None
-
-from config import experiment_config
+from config import ABLATION_CONFIGS, EXPERIMENT_PHASES, EvaluationConfig
+from evaluation_fivr5k import FIVR5KEvaluator
 
 
-class AblationStudy:
-    """消融实验类（修复编码问题版本）"""
+class AblationStudyExperiment:
+    """消融实验 - 修复参数传递版本"""
 
-    def __init__(self):
-        self.config = experiment_config
-        self.results_dir = os.path.join(self.config.output_dir, "ablation_study")
-        os.makedirs(self.results_dir, exist_ok=True)
+    def __init__(self, base_output_dir="paper_experiments/ablation_study"):
+        # ==================== 修复点1：使用base_output_dir ====================
+        self.base_output_dir = base_output_dir
+        os.makedirs(base_output_dir, exist_ok=True)
 
-        # 论文结果
-        self.paper_results = self.config.paper_results
+        # 实验记录
+        self.results = []
+        self.start_time = time.time()
 
-        # 您的当前结果
-        self.your_results = self.load_your_results()
-
-        # 实验配置
-        self.experiments = [
-            {
-                "name": "ViSiLf",
-                "desc": "基础特征提取 (L3-iMAC9x)",
-                "components": ["L3-iMAC9x"],
-            },
-            {
-                "name": "ViSiLf+W",
-                "desc": "基础 + 白化",
-                "components": ["L3-iMAC9x", "Whitening"],
-            },
-            {
-                "name": "ViSiLf+W+A",
-                "desc": "基础 + 白化 + 注意力",
-                "components": ["L3-iMAC9x", "Whitening", "Attention"],
-            },
-            {
-                "name": "ViSiLsym",
-                "desc": "对称 Chamfer 相似度",
-                "components": ["L3-iMAC9x", "Whitening", "Attention", "Symmetric"],
-            },
-            {
-                "name": "ViSiLv",
-                "desc": "完整模型 (ViSiLv)",
-                "components": ["L3-iMAC9x", "Whitening", "Attention", "Video Comparator"],
-            },
-        ]
-
-    def load_your_results(self) -> Dict:
-        """加载您的结果"""
-        # 尝试加载您的FIVR-5K结果
-        result_file = os.path.join(self.config.output_dir, "fivr5k_results", "task_results_ViSiLv.json")
-
-        if os.path.exists(result_file):
-            try:
-                with open(result_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except:
-                pass
-
-        # 使用您提供的结果
-        return {
-            "DSVR": 0.6247751074765724,
-            "CSVR": 0.6416741577861441,
-            "ISVR": 0.5930094676455455
+        # 论文结果参考
+        self.paper_results = {
+            "visil_v": {"DSVR": 0.882, "CSVR": 0.869, "ISVR": 0.777},
+            "visil_f_w_a": {"DSVR": 0.869, "CSVR": 0.852, "ISVR": 0.755},
+            "visil_f_w": {"DSVR": 0.851, "CSVR": 0.833, "ISVR": 0.738},
+            "visil_f": {"DSVR": 0.838, "CSVR": 0.832, "ISVR": 0.739},
+            "visil_sym": {"DSVR": 0.882, "CSVR": 0.869, "ISVR": 0.777},
         }
 
-    def run_study(self):
-        """运行消融实验分析"""
-        print("\n" + "="*80)
-        print("消融实验分析")
-        print("="*80)
+        print("=" * 80)
+        print("ViSiL 消融实验（修复参数传递）")
+        print("=" * 80)
+        print(f"基础输出目录: {base_output_dir}")
+        print(f"消融配置数: {len(ABLATION_CONFIGS)}")
+        print(f"实验顺序: {EXPERIMENT_PHASES}")
 
-        # 1. 展示论文结果
-        self.display_paper_results()
+    def generate_experiment_id(self, config_name):
+        """生成唯一的实验ID"""
+        timestamp = str(int(time.time()))[-6:]
+        random_suffix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz', k=4))
+        return f"{config_name}_{timestamp}_{random_suffix}"
 
-        # 2. 与您的结果对比
-        self.compare_with_your_results()
+    def check_baseline_performance(self, baseline_result):
+        """检查baseline性能是否达到论文要求"""
+        if baseline_result is None:
+            return False, "没有baseline结果"
 
-        # 3. 分析各组件贡献
-        self.analyze_component_contributions()
+        exp_dsvr = baseline_result.get("evaluation_results", {}).get("DSVR", 0)
+        paper_dsvr = self.paper_results.get("visil_v", {}).get("DSVR", 0.882)
 
-        # 4. 正则化影响分析
-        self.analyze_regularization_impact()
+        diff = abs(exp_dsvr - paper_dsvr)
 
-        # 5. 生成报告
+        if diff < 0.02:  # 差异小于2%
+            return True, f"通过 (实验: {exp_dsvr:.4f}, 论文: {paper_dsvr:.4f}, 差异: {diff:.4f})"
+        elif diff < 0.05:  # 差异小于5%
+            return True, f"接近 (实验: {exp_dsvr:.4f}, 论文: {paper_dsvr:.4f}, 差异: {diff:.4f})"
+        else:
+            return False, f"未达标 (实验: {exp_dsvr:.4f}, 论文: {paper_dsvr:.4f}, 差异: {diff:.4f})"
+
+    def run_single_experiment(self, config_name: str, feature_config) -> dict:
+        """运行单个消融配置的实验"""
+        print(f"\n{'=' * 60}")
+        print(f"消融实验: {config_name}")
+        print(f"{'=' * 60}")
+
+        # ==================== 修复点2：为每个实验生成唯一ID ====================
+        experiment_id = self.generate_experiment_id(config_name)
+
+        # ==================== 修复点3：根据实验阶段设置清理策略 ====================
+        # 只有第一个实验清理缓存，后续实验复用缓存但不清理
+        clear_cache = False
+        if config_name == "visil_v":
+            clear_cache = True
+            print(f"> 清理缓存: 是 (baseline实验，清理特征缓存)")
+        else:
+            print(f"> 清理缓存: 否 (复用缓存)")
+
+        # 创建配置
+        config = EvaluationConfig(
+            base_output_dir="output",  # 使用统一的output目录
+            experiment_id=experiment_id,
+            feature_config=feature_config,
+            clear_cache=clear_cache
+        )
+
+        try:
+            # 运行评估
+            evaluator = FIVR5KEvaluator(config)
+            result = evaluator.evaluate()
+
+            # 记录结果
+            experiment_result = {
+                "config_name": config_name,
+                "experiment_id": experiment_id,
+                "feature_config": config.feature_config.to_dict(),
+                "evaluation_results": result["evaluation"],
+                "total_time": result["total_time"],
+                "output_dir": result["output_dir"],
+                "timestamp": datetime.now().isoformat()
+            }
+
+            print(f"> 实验完成: {config_name}")
+            print(f"  实验ID: {experiment_id}")
+            print(f"  DSVR: {experiment_result['evaluation_results'].get('DSVR', 0):.4f}")
+
+            # 打印消融配置
+            feature_cfg = config.feature_config
+            print(f"  配置详情:")
+            print(f"    注意力: {feature_cfg.use_attention}")
+            print(f"    视频比较器: {feature_cfg.use_video_comparator}")
+            print(f"    PCA: {feature_cfg.use_pca}")
+            print(f"    对称: {feature_cfg.symmetric}")
+
+            return experiment_result
+
+        except Exception as e:
+            print(f"> 实验失败 {config_name}: {e}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "config_name": config_name,
+                "experiment_id": experiment_id,
+                "error": str(e),
+                "timestamp": datetime.now().isoformat()
+            }
+
+    def run_phase_experiments(self, phase_name, config_names):
+        """运行指定阶段的实验"""
+        print(f"\n{'=' * 80}")
+        print(f"阶段: {phase_name}")
+        print(f"配置: {config_names}")
+        print(f"{'=' * 80}")
+
+        phase_results = []
+
+        for config_name in tqdm(config_names, desc=f"阶段 {phase_name}"):
+            if config_name in ABLATION_CONFIGS:
+                feature_config = ABLATION_CONFIGS[config_name]
+                result = self.run_single_experiment(config_name, feature_config)
+                phase_results.append(result)
+                self.results.append(result)
+
+                # 每完成一个实验保存一次进度
+                self.save_progress()
+            else:
+                print(f"> 跳过未知的消融配置: {config_name}")
+
+        return phase_results
+
+    def run_all_experiments(self, phases=None, num_workers=1, feature_batch_size=16,
+                            cpu_only=False, auto_continue=False):
+        """按阶段运行所有消融实验"""
+        if phases is None:
+            phases = EXPERIMENT_PHASES
+
+        print(f"\n开始按论文顺序进行消融实验...")
+        print(f"并行数: {num_workers}, 特征批次大小: {feature_batch_size}, CPU模式: {cpu_only}")
+        print(f"自动继续模式: {'开启' if auto_continue else '关闭'}")
+
+        # 阶段1：ViSiL_v（baseline）
+        phase1_results = self.run_phase_experiments(
+            "阶段1: 验证ViSiL_v", phases.get("phase1", []),
+            num_workers=num_workers, feature_batch_size=feature_batch_size,
+            cpu_only=cpu_only, clear_cache=True
+        )
+
+        # 检查baseline性能
+        baseline_result = next((r for r in phase1_results if r.get("config_name") == "visil_v"), None)
+        if baseline_result and "evaluation_results" in baseline_result:
+            exp_dsvr = baseline_result["evaluation_results"].get("DSVR", 0)
+            paper_dsvr = self.paper_results["visil_v"]["DSVR"]
+            diff = abs(exp_dsvr - paper_dsvr)
+            print(f"\n> Baseline检查: 实验={exp_dsvr:.4f}, 论文={paper_dsvr:.4f}, 差异={diff:.4f}")
+
+            if diff >= 0.05:
+                print("> 警告: Baseline性能与论文差距较大")
+                if not auto_continue:
+                    response = input("> 是否继续后续实验？(y/n): ").strip().lower()
+                    if response != 'y':
+                        print("> 用户终止实验")
+                        return
+                else:
+                    print("> 自动继续模式开启，继续执行...")
+        else:
+            print("> 警告: 未获取到有效的baseline结果")
+            if not auto_continue:
+                response = input("> 是否继续？(y/n): ").strip().lower()
+                if response != 'y':
+                    print("> 用户终止实验")
+                    return
+            else:
+                print("> 自动继续模式开启，继续执行...")
+
+        # 阶段2：消融实验
+        phase2_results = self.run_phase_experiments(
+            "阶段2: 消融实验", phases.get("phase2", []),
+            num_workers=num_workers, feature_batch_size=feature_batch_size,
+            cpu_only=cpu_only, clear_cache=False
+        )
+        # 生成报告
         self.generate_report()
+        total_time = time.time() - self.start_time
+        print(f"\n{'=' * 80}")
+        print(f"消融实验完成!")
+        print(f"总耗时: {total_time:.2f} 秒 ({total_time / 60:.1f} 分钟)")
+        print(f"结果保存到: {self.base_output_dir}")
+        print(f"{'=' * 80}")
 
-        print("\n" + "="*80)
-        print("消融实验分析完成!")
-        print("="*80)
-
-    def display_paper_results(self):
-        """展示论文结果"""
-        print("\n" + "="*50)
-        print("1. 论文消融实验结果 (表3)")
-        print("="*50)
-
-        print(f"{'模型':<20} {'DSVR':<10} {'CSVR':<10} {'ISVR':<10} {'描述':<30}")
-        print("-" * 80)
-
-        for exp in self.experiments:
-            name = exp["name"]
-            if name in self.paper_results["table3"]:
-                results = self.paper_results["table3"][name]
-                print(f"{name:<20} {results['DSVR']:<10.3f} {results['CSVR']:<10.3f} "
-                      f"{results['ISVR']:<10.3f} {exp['desc']}")
-
-    def compare_with_your_results(self):
-        """与您的结果对比"""
-        print("\n" + "="*50)
-        print("2. 与您的结果对比")
-        print("="*50)
-
-        paper_visilv = self.paper_results["table3"]["ViSiLv"]
-
-        print(f"{'任务':<8} {'论文(ViSiLv)':<12} {'您的结果':<12} {'差异':<12} {'相对差距':<12}")
-        print("-" * 60)
-
-        for task in ["DSVR", "CSVR", "ISVR"]:
-            paper_score = paper_visilv[task]
-            your_score = self.your_results.get(task, 0.0)
-            diff = your_score - paper_score
-            rel_diff = diff / paper_score * 100 if paper_score > 0 else 0
-
-            print(f"{task:<8} {paper_score:<12.4f} {your_score:<12.4f} "
-                  f"{diff:+.4f} ({rel_diff:+.1f}%)")
-
-    def analyze_component_contributions(self):
-        """分析各组件贡献"""
-        print("\n" + "="*50)
-        print("3. 各组件对DSVR任务的贡献")
-        print("="*50)
-
-        table3 = self.paper_results["table3"]
-
-        contributions = [
-            ("L3-iMAC9x", "基础特征", table3["ViSiLf"]["DSVR"]),
-            ("+ Whitening", "白化", table3["ViSiLf+W"]["DSVR"] - table3["ViSiLf"]["DSVR"]),
-            ("+ Attention", "注意力", table3["ViSiLf+W+A"]["DSVR"] - table3["ViSiLf+W"]["DSVR"]),
-            ("+ Video Comparator", "视频比较器", table3["ViSiLv"]["DSVR"] - table3["ViSiLf+W+A"]["DSVR"]),
-        ]
-
-        print(f"{'组件':<25} {'提升':<12} {'累计':<12} {'贡献说明':<20}")
-        print("-" * 70)
-
-        cumulative = 0.0
-        for component, desc, improvement in contributions:
-            cumulative += improvement
-            print(f"{component:<25} {improvement:<12.4f} {cumulative:<12.4f} {desc:<20}")
-
-        print(f"\n总提升: {cumulative:.4f} (从 {table3['ViSiLf']['DSVR']:.3f} 到 {table3['ViSiLv']['DSVR']:.3f})")
-
-        # 计算相对提升百分比
-        baseline = table3["ViSiLf"]["DSVR"]
-        final = table3["ViSiLv"]["DSVR"]
-        total_relative = (final - baseline) / baseline * 100
-        print(f"相对提升: {total_relative:.1f}%")
-
-    def analyze_regularization_impact(self):
-        """分析正则化影响"""
-        print("\n" + "="*50)
-        print("4. 正则化影响分析 (表4)")
-        print("="*50)
-
-        table4 = self.paper_results["table4"]
-
-        print(f"{'配置':<20} {'DSVR':<10} {'CSVR':<10} {'ISVR':<10} {'提升':<10}")
-        print("-" * 60)
-
-        for config_name, config_desc in [("without_reg", "无正则化"), ("with_reg", "有正则化")]:
-            results = table4[config_name]
-            print(f"{config_desc:<20} {results['DSVR']:<10.3f} {results['CSVR']:<10.3f} "
-                  f"{results['ISVR']:<10.3f}")
-
-        # 计算正则化带来的提升
-        reg_improvement = {
-            "DSVR": table4["with_reg"]["DSVR"] - table4["without_reg"]["DSVR"],
-            "CSVR": table4["with_reg"]["CSVR"] - table4["without_reg"]["CSVR"],
-            "ISVR": table4["with_reg"]["ISVR"] - table4["without_reg"]["ISVR"],
-        }
-
-        print(f"\n正则化带来的提升:")
-        for task in ["DSVR", "CSVR", "ISVR"]:
-            print(f"  {task}: +{reg_improvement[task]:.4f} "
-                  f"({reg_improvement[task]/table4['without_reg'][task]*100:.1f}%)")
+    def save_progress(self):
+        """保存实验进度"""
+        progress_file = os.path.join(self.base_output_dir, "experiment_progress.json")
+        try:
+            with open(progress_file, 'w') as f:
+                json.dump({
+                    "results": self.results,
+                    "total_experiments": len(self.results),
+                    "elapsed_time": time.time() - self.start_time
+                }, f, indent=2, ensure_ascii=False, default=str)
+        except Exception as e:
+            print(f"> 保存进度失败: {e}")
 
     def generate_report(self):
-        """生成报告"""
-        report_file = os.path.join(self.results_dir, "ablation_study_report.txt")
+        """生成消融实验报告"""
+        # 过滤成功的实验
+        successful_results = [r for r in self.results if "evaluation_results" in r]
 
-        with open(report_file, 'w', encoding='utf-8') as f:
-            f.write("消融实验分析报告\n")
-            f.write("=" * 60 + "\n\n")
-            f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        if not successful_results:
+            print("> 没有成功的实验结果")
+            return
 
-            # 1. 论文结果
-            f.write("一、论文消融实验结果 (表3):\n")
-            f.write("-" * 60 + "\n")
-            for exp in self.experiments:
-                name = exp["name"]
-                if name in self.paper_results["table3"]:
-                    results = self.paper_results["table3"][name]
-                    f.write(f"{name:<20} DSVR={results['DSVR']:.3f}, "
-                           f"CSVR={results['CSVR']:.3f}, ISVR={results['ISVR']:.3f}\n")
+        # 生成文本报告
+        report_file = os.path.join(self.base_output_dir, "ablation_study_report.txt")
+        try:
+            with open(report_file, 'w', encoding='utf-8') as f:
+                f.write("=" * 80 + "\n")
+                f.write("ViSiL 消融实验报告\n")
+                f.write("修复参数传递版本\n")
+                f.write("=" * 80 + "\n\n")
 
-            # 2. 与您的结果对比
-            f.write("\n二、与您的结果对比:\n")
-            f.write("-" * 60 + "\n")
-            paper_visilv = self.paper_results["table3"]["ViSiLv"]
-            for task in ["DSVR", "CSVR", "ISVR"]:
-                diff = self.your_results.get(task, 0.0) - paper_visilv[task]
-                f.write(f"{task}: 论文={paper_visilv[task]:.3f}, "
-                       f"您的={self.your_results.get(task, 0.0):.4f}, "
-                       f"差异={diff:+.4f}\n")
+                f.write(f"实验时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"总实验数: {len(self.results)}\n")
+                f.write(f"成功实验数: {len(successful_results)}\n")
+                f.write(f"总耗时: {time.time() - self.start_time:.1f}秒\n\n")
 
-            # 3. 组件贡献
-            f.write("\n三、各组件贡献分析:\n")
-            f.write("-" * 60 + "\n")
-            table3 = self.paper_results["table3"]
-            contributions = [
-                ("L3-iMAC9x", table3["ViSiLf"]["DSVR"]),
-                ("+ Whitening", table3["ViSiLf+W"]["DSVR"] - table3["ViSiLf"]["DSVR"]),
-                ("+ Attention", table3["ViSiLf+W+A"]["DSVR"] - table3["ViSiLf+W"]["DSVR"]),
-                ("+ Video Comparator", table3["ViSiLv"]["DSVR"] - table3["ViSiLf+W+A"]["DSVR"]),
-            ]
+                # 按实验阶段组织结果
+                phases = EXPERIMENT_PHASES
 
-            cumulative = 0.0
-            for component, improvement in contributions:
-                cumulative += improvement
-                f.write(f"{component:<25}: {improvement:+.4f} (累计: {cumulative:.4f})\n")
+                # ==================== 阶段1结果 ====================
+                f.write("=" * 80 + "\n")
+                f.write("阶段1: ViSiL_v (Baseline)\n")
+                f.write("=" * 80 + "\n\n")
 
-            # 4. 正则化影响
-            f.write("\n四、正则化影响 (表4):\n")
-            f.write("-" * 60 + "\n")
-            table4 = self.paper_results["table4"]
-            for config_name, config_desc in [("without_reg", "无正则化"), ("with_reg", "有正则化")]:
-                results = table4[config_name]
-                f.write(f"{config_desc}: DSVR={results['DSVR']:.3f}, "
-                       f"CSVR={results['CSVR']:.3f}, ISVR={results['ISVR']:.3f}\n")
+                phase1_results = [r for r in successful_results if r.get("config_name") in phases["phase1"]]
+                for result in phase1_results:
+                    eval_results = result.get("evaluation_results", {})
+                    f.write(f"{result.get('config_name', 'Unknown')} (ID: {result.get('experiment_id', 'N/A')}):\n")
+                    f.write(
+                        f"  DSVR: {eval_results.get('DSVR', 0):.4f} (论文: {self.paper_results.get(result.get('config_name'), {}).get('DSVR', 0):.4f})\n")
+                    f.write(
+                        f"  CSVR: {eval_results.get('CSVR', 0):.4f} (论文: {self.paper_results.get(result.get('config_name'), {}).get('CSVR', 0):.4f})\n")
+                    f.write(
+                        f"  ISVR: {eval_results.get('ISVR', 0):.4f} (论文: {self.paper_results.get(result.get('config_name'), {}).get('ISVR', 0):.4f})\n\n")
 
-            # 5. 总结
-            f.write("\n五、总结:\n")
-            f.write("-" * 60 + "\n")
-            avg_gap = np.mean([
-                paper_visilv[task] - self.your_results.get(task, 0.0)
-                for task in ["DSVR", "CSVR", "ISVR"]
-            ])
+                # ==================== 阶段2结果 ====================
+                f.write("\n" + "=" * 80 + "\n")
+                f.write("阶段2: 消融实验\n")
+                f.write("=" * 80 + "\n\n")
 
-            if avg_gap > 0.2:
-                f.write("结论: [严重] 差距较大，需要检查核心实现\n")
-            elif avg_gap > 0.1:
-                f.write("结论: [中等] 中等差距，需要优化参数\n")
-            elif avg_gap > 0.05:
-                f.write("结论: [良好] 差距较小，接近论文结果\n")
-            else:
-                f.write("结论: [优秀] 复现成功，结果优秀\n")
+                phase2_results = [r for r in successful_results if r.get("config_name") in phases["phase2"]]
 
-            f.write(f"平均差距: {avg_gap:.4f}\n")
+                # 获取baseline结果
+                baseline = next((r for r in phase1_results if r.get("config_name") == "visil_v"), None)
+                baseline_dsvr = baseline.get("evaluation_results", {}).get("DSVR", 0) if baseline else 0
 
-            # 6. 建议
-            f.write("\n六、改进建议:\n")
-            f.write("-" * 60 + "\n")
-            suggestions = [
-                "1. 检查是否使用L3-iMAC9x特征 (9 regions, 3840 dim)",
-                "2. 验证白化权重是否正确加载",
-                "3. 确保使用注意力机制",
-                "4. 检查视频比较器CNN是否启用",
-                "5. 确认使用正确的相似度函数 (Chamfer vs Symmetric Chamfer)",
-                "6. 检查训练参数: lr=10e-5, gamma=0.5, r=0.1",
-                "7. 验证数据预处理: 1 fps, center crop 224x224",
-            ]
+                f.write(f"Baseline DSVR: {baseline_dsvr:.4f}\n\n")
+                f.write(
+                    f"{'配置':<15} {'实验DSVR':<12} {'论文DSVR':<12} {'差异':<12} {'PCA':<8} {'注意力':<10} {'比较器':<10}\n")
+                f.write("-" * 80 + "\n")
 
-            for suggestion in suggestions:
-                f.write(suggestion + "\n")
+                for result in phase2_results:
+                    config_name = result.get("config_name", "")
+                    eval_results = result.get("evaluation_results", {})
+                    exp_dsvr = eval_results.get("DSVR", 0)
+                    paper_dsvr = self.paper_results.get(config_name, {}).get("DSVR", 0)
+                    feature_cfg = result.get("feature_config", {})
 
-        # 保存JSON数据
-        json_file = os.path.join(self.results_dir, "ablation_study_data.json")
-        data = {
-            "paper_results": self.paper_results,
-            "your_results": self.your_results,
-            "analysis": {
-                "avg_gap": avg_gap,
-                "status": "needs_improvement" if avg_gap > 0.1 else "close"
-            }
+                    # 计算相对于baseline的变化
+                    change = exp_dsvr - baseline_dsvr
+                    change_percent = (change / baseline_dsvr) * 100 if baseline_dsvr > 0 else 0
+
+                    f.write(
+                        f"{config_name:<15} {exp_dsvr:.4f}        {paper_dsvr:.4f}        {change:+.4f} ({change_percent:+.1f}%)  ")
+                    f.write(f"{feature_cfg.get('use_pca', False)!s:<8} ")
+                    f.write(f"{feature_cfg.get('use_attention', False)!s:<10} ")
+                    f.write(f"{feature_cfg.get('use_video_comparator', False)!s:<10}\n")
+
+                # ==================== 阶段3结果 ====================
+                f.write("\n" + "=" * 80 + "\n")
+                f.write("阶段3: 对称版本\n")
+                f.write("=" * 80 + "\n\n")
+
+                phase3_results = [r for r in successful_results if r.get("config_name") in phases["phase3"]]
+                for result in phase3_results:
+                    eval_results = result.get("evaluation_results", {})
+                    config_name = result.get("config_name", "")
+                    paper_result = self.paper_results.get(config_name, {})
+
+                    f.write(f"{config_name} (ID: {result.get('experiment_id', 'N/A')}):\n")
+                    f.write(
+                        f"  实验DSVR: {eval_results.get('DSVR', 0):.4f} (论文: {paper_result.get('DSVR', 0):.4f})\n")
+                    f.write(
+                        f"  实验CSVR: {eval_results.get('CSVR', 0):.4f} (论文: {paper_result.get('CSVR', 0):.4f})\n")
+                    f.write(
+                        f"  实验ISVR: {eval_results.get('ISVR', 0):.4f} (论文: {paper_result.get('ISVR', 0):.4f})\n\n")
+
+            print(f"> 消融实验报告已生成: {report_file}")
+
+        except Exception as e:
+            print(f"> 生成报告失败: {e}")
+
+
+def run_ablation_study():
+    """运行消融实验"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description='消融实验')
+    parser.add_argument('--base_output_dir', type=str, default='paper_experiments/ablation_study',
+                        help='基础输出目录')
+    parser.add_argument('--phase', type=str, choices=['all', 'phase1', 'phase2', 'phase3'],
+                        default='all', help='运行阶段')
+    parser.add_argument('--auto_continue', action='store_true', help='自动继续实验，无需人工确认')
+
+    args = parser.parse_args()
+
+    print("=" * 60)
+    print("ViSiL 消融实验（修复参数传递版本）")
+    print("=" * 60)
+
+    experiment = AblationStudyExperiment(args.base_output_dir)
+
+    if args.phase == 'all':
+        experiment.run_all_experiments()
+    else:
+        # 只运行指定阶段
+        phases = {
+            "phase1": EXPERIMENT_PHASES["phase1"],
+            "phase2": EXPERIMENT_PHASES["phase2"],
+            "phase3": EXPERIMENT_PHASES["phase3"]
         }
+        experiment.run_phase_experiments(args.phase, phases.get(args.phase, []))
 
-        with open(json_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-
-        print(f"\n> 消融实验报告已保存到: {self.results_dir}/")
-        print(f"  - {report_file}")
-        print(f"  - {json_file}")
-
-
-def main():
-    """主函数"""
-    study = AblationStudy()
-    study.run_study()
+    return experiment.results
 
 
 if __name__ == '__main__':
-    main()
+    run_ablation_study()

@@ -1,600 +1,550 @@
+# base_evaluator.py - 基础评估器（修复帧提取，仿照evaluation.py）
 """
-base_evaluator.py
-统一的基础评估类（修复版）- 完全对齐evaluation.py的功能
+基础评估器类 - 仿照evaluation.py修复帧提取
+修复点：完全仿照evaluation.py的帧提取逻辑
+修复点：使用VideoGenerator正确提取帧
+修复点：修复特征提取缓存逻辑
 """
 
 import torch
-import numpy as np
-import json
 import os
+import json
 import gc
-import cv2
+import numpy as np
 import time
-import pickle
-from pathlib import Path
 from tqdm import tqdm
-from typing import Dict, List, Tuple, Optional, Set
-import sys
 import traceback
 
-# 设置系统编码为UTF-8
-sys.stdout.reconfigure(encoding='utf-8') if hasattr(sys.stdout, 'reconfigure') else None
+from model.visil import ViSiL
+from torch.utils.data import DataLoader
+from datasets.generators import VideoGenerator
 
-from config import experiment_config, model_config
-# 导入ViSiL模型
-try:
-    from model.visil import ViSiL
-except ImportError:
-    print("警告: 无法导入ViSiL模型，使用模拟模型")
-    # 创建模拟模型类
-    class ViSiL:
-        def __init__(self, **kwargs):
-            pass
-        def eval(self):
-            pass
-        def extract_features(self, frames):
-            # 返回随机特征作为占位符
-            return torch.randn(frames.shape[0], 9, 3840)
-        def calculate_video_similarity(self, query_features, db_features):
-            # 返回随机相似度
-            return torch.tensor(0.5)
-
-def handle_exception(exc_type, exc_value, exc_traceback):
-    print("\n" + "="*60)
-    print("发生未捕获的异常:")
-    print("="*60)
-    traceback.print_exception(exc_type, exc_value, exc_traceback)
-    print("="*60)
-    print("\n程序将退出...")
-    sys.exit(1)
+from config import EvaluationConfig
 
 
 class BaseEvaluator:
-    """统一的基础评估类（修复版）- 完全对齐evaluation.py的功能"""
+    """基础评估器 - 仿照evaluation.py修复版"""
 
-    def __init__(self, config=None):
-        if config is None:
-            from config import experiment_config as exp_config
-            self.config = exp_config
-        else:
-            self.config = config
+    def __init__(self, config: EvaluationConfig):
+        self.config = config
+        self.device = config.device
 
-        # 设置异常处理
-        sys.excepthook = handle_exception
+        # ==================== 修复点1：验证配置正确性 ====================
+        print(f"\n> 验证实验配置:")
+        print(f"  实验ID: {config.experiment_id}")
+        print(f"  特征配置: {config.feature_config.name}")
+        print(f"  设备: {self.device}")
+        print(f"  帧目录: {config.frames_dir}")
+        print(f"  特征目录: {config.features_dir}")
 
-        # 设备选择
-        self.device = self.get_device()
-        print(f"> 使用设备: {self.device}")
+        # 打印特征配置详情
+        feature_cfg = config.feature_config
+        print(f"  特征参数:")
+        print(f"    网络: {feature_cfg.network}")
+        print(f"    特征维度: {feature_cfg.feature_dim}")
+        print(f"    区域: {feature_cfg.regions}")
+        print(f"    级别: L{feature_cfg.level}")
+        print(f"    PCA: {feature_cfg.use_pca}")
+        print(f"    注意力: {feature_cfg.use_attention}")
+        print(f"    视频比较器: {feature_cfg.use_video_comparator}")
+        print(f"    对称: {feature_cfg.symmetric}")
+
+        # 清理缓存（如果配置要求）
+        if config.clear_cache:
+            self.clear_cached_files()
 
         # 初始化模型
-        self.model = self.initialize_model()
+        self.model = self.init_model()
 
-        # 内存管理
-        self.memory_threshold = 4.0  # GB
-        self.processed_videos = set()
+        # 加载数据集
+        self.dataset = self.load_dataset()
 
-        # 检查点
-        self.checkpoint_dir = os.path.join(self.config.output_dir, "checkpoints")
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        print(f"> 初始化完成")
 
-        # 确保特征目录存在
+    def clear_cached_files(self):
+        """清理缓存文件 - 只清理特征缓存，不清理帧缓存"""
+        print("> 清理特征缓存文件...")
+        import shutil
+
+        # 只清理当前配置的特征缓存目录
+        if os.path.exists(self.config.features_dir):
+            try:
+                shutil.rmtree(self.config.features_dir)
+                print(f"> 已清理: {self.config.features_dir}")
+            except Exception as e:
+                print(f"> 清理失败 {self.config.features_dir}: {e}")
+
+        # 重新创建特征目录
         os.makedirs(self.config.features_dir, exist_ok=True)
 
-        # 确保帧目录存在
-        os.makedirs(self.config.frames_dir, exist_ok=True)
+    def init_model(self) -> ViSiL:
+        """初始化ViSiL模型 - 根据配置正确设置参数"""
+        print(f"> 初始化模型: {self.config.feature_config.name}")
 
-        # 统计信息
-        self.stats = {
-            "total_videos": 0,
-            "frames_loaded_from_cache": 0,
-            "frames_extracted_from_video": 0,
-            "frames_failed": 0,
-            "features_loaded_from_cache": 0,
-            "features_extracted": 0,
-            "features_failed": 0,
-            "video_files_found": 0,
-            "video_files_missing": 0
-        }
-
-    def get_device(self):
-        """获取计算设备"""
-        if not torch.cuda.is_available():
-            return torch.device('cpu')
-        return torch.device(f'cuda:{model_config.gpu_id}')
-
-    def initialize_model(self):
-        """初始化模型（修复预训练权重加载问题）"""
-        print("> 初始化ViSiL模型...")
+        # 根据特征配置设置模型参数
+        feature_config = self.config.feature_config
 
         try:
-            # 根据配置设置对称性
-            symmetric = model_config.symmetric or ('sym' in model_config.model_type.lower())
-
-            print(f"> 创建模型: {model_config.model_type}")
-            print(f"> 对称性: {symmetric}")
-            print(f"> 使用预训练: {model_config.pretrained}")
-
-            # 根据论文表3，ViSiLv使用3840维特征（L3-iMAC9x），预训练PCA降维到512维
-            if model_config.pretrained:
-                feature_dim = 512
-                print(f"> 特征维度: 512 (预训练模型使用PCA降维)")
-            else:
-                feature_dim = 3840  # L3-iMAC9x原始维度
-                print(f"> 特征维度: {feature_dim} (L3-iMAC9x)")
-
-            # 创建模型
+            # ==================== 修复点2：正确传递模型参数 ====================
             model = ViSiL(
-                network=model_config.network,
-                pretrained=model_config.pretrained,
-                dims=feature_dim,
-                whiteninig=model_config.whiteninig,
-                attention=model_config.attention,
-                video_comperator=model_config.video_comperator,
-                symmetric=symmetric
+                pretrained=True,
+                symmetric=feature_config.symmetric,
+                whiteninig=feature_config.use_pca,
+                attention=feature_config.use_attention,
+                video_comperator=feature_config.use_video_comparator,
+                dims=feature_config.feature_dim
             ).to(self.device)
 
-            # 设置为评估模式
             model.eval()
 
-            # 检查预训练权重是否加载成功
-            if model_config.pretrained:
-                print("> 检查预训练权重加载...")
-                # 检查模型参数是否已更新（不是随机初始化）
-                total_params = sum(p.numel() for p in model.parameters())
-                print(f"> 模型总参数: {total_params:,}")
+            # 验证模型配置
+            print(f"> 模型加载成功，验证配置:")
+            print(f"  实际对称设置: {model.visil_head.symmetric}")
 
-                # 检查ViSiL头部参数
-                if hasattr(model, 'visil_head'):
-                    head_params = list(model.visil_head.parameters())
-                    if head_params:
-                        first_param = head_params[0]
-                        param_mean = first_param.data.mean().item()
-                        param_std = first_param.data.std().item()
-                        print(f"> ViSiL头部第一个参数 - 均值: {param_mean:.6f}, 标准差: {param_std:.6f}")
+            if feature_config.use_attention:
+                if model.visil_head.attention is None:
+                    print("> 警告: 配置要求注意力机制，但模型未启用")
+                else:
+                    print("> 注意力机制: 已启用")
 
-                        # 如果参数接近0，可能是权重未正确加载
-                        if abs(param_mean) < 0.001 and param_std < 0.001:
-                            print("> 警告: 模型参数可能未正确加载")
-                        else:
-                            print("> ✓ 预训练权重似乎已加载")
+            if feature_config.use_video_comparator:
+                if model.visil_head.video_comperator is None:
+                    print("> 警告: 配置要求视频比较器，但模型未启用")
+                else:
+                    print("> 视频比较器: 已启用")
 
-            print(f"> 模型配置成功")
-            print(f"> 使用白化: {model_config.whiteninig}")
-            print(f"> 使用注意力: {model_config.attention}")
-            print(f"> 使用视频比较器: {model_config.video_comperator}")
+            if feature_config.use_pca:
+                if model.cnn.pca is None:
+                    print("> 警告: 配置要求PCA，但模型未启用")
+                else:
+                    print("> PCA: 已启用")
 
             return model
 
         except Exception as e:
-            print(f"> 初始化模型失败: {e}")
-            import traceback
+            print(f"> 模型初始化失败: {e}")
             traceback.print_exc()
             raise
 
-    def cleanup_memory(self):
-        """清理内存"""
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
+    def load_dataset(self):
+        """加载数据集 - 修复版本"""
+        dataset_name = self.config.dataset
 
-    def find_video_file(self, video_id: str) -> Optional[str]:
-        """查找视频文件路径"""
-        # 方法1: 直接按配置路径查找
-        video_path = os.path.join(self.config.video_dir,
-                                 self.config.video_pattern.format(id=video_id))
+        try:
+            if 'FIVR' in dataset_name:
+                from datasets import FIVR
+                version = dataset_name.split('-')[1].lower() if '-' in dataset_name else '5k'
+                dataset = FIVR(version=version)
+                print(f"> 数据集加载成功: {dataset.name}")
+                print(f"> 查询视频数: {len(dataset.get_queries())}")
+                print(f"> 数据库视频数: {len(dataset.get_database())}")
+                return dataset
+            else:
+                raise ValueError(f"未知的数据集: {dataset_name}")
 
-        if os.path.exists(video_path):
-            return video_path
+        except ImportError as e:
+            print(f"> 错误: 无法导入数据集模块 - {e}")
+            raise
 
-        # 方法2: 在视频目录中搜索
-        print(f"> 在 {self.config.video_dir} 中搜索视频 {video_id}...")
-
-        video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv']
-
-        for root, dirs, files in os.walk(self.config.video_dir):
-            for file in files:
-                # 检查文件名是否包含video_id
-                if video_id in file:
-                    # 检查文件扩展名
-                    ext = os.path.splitext(file)[1].lower()
-                    if ext in video_extensions:
-                        found_path = os.path.join(root, file)
-                        print(f"> 找到视频: {found_path}")
-                        return found_path
-
-        return None
-
-    def load_frames(self, video_id: str) -> Optional[torch.Tensor]:
-        """加载帧数据 - 完全对齐evaluation.py的功能"""
-        self.stats["total_videos"] += 1
-
+    def extract_frames_from_video(self, video_path: str, video_id: str) -> torch.Tensor:
+        """
+        从视频提取帧 - 完全仿照evaluation.py的实现
+        修复点：使用与evaluation.py完全相同的逻辑
+        """
         frames_file = os.path.join(self.config.frames_dir, f"{video_id}.npy")
 
-        # 1. 首先尝试从npy文件加载（快速缓存）
+        # ==================== 修复点3：优先检查共享帧缓存 ====================
         if os.path.exists(frames_file):
             try:
-                frames_np = np.load(frames_file)
-
-                # 处理不同形状的帧数据
-                if len(frames_np.shape) == 3:
-                    # [T, H, W, C] 或 [T, C, H, W]
-                    if frames_np.shape[-1] == 3:  # [T, H, W, C]
-                        frames = torch.from_numpy(frames_np).float()
-                    else:  # 假设是 [T, C, H, W]
-                        frames = torch.from_numpy(frames_np).float().permute(0, 2, 3, 1)
-                elif len(frames_np.shape) == 4:
-                    # 已经是正确的形状
-                    frames = torch.from_numpy(frames_np).float()
-                else:
-                    print(f"> 警告: 未知的帧形状 {frames_np.shape}")
-                    self.stats["frames_failed"] += 1
-                    return None
-
-                if frames.shape[0] >= 4:  # 至少需要4帧
-                    self.stats["frames_loaded_from_cache"] += 1
-                    return frames
+                file_size = os.path.getsize(frames_file)
+                if file_size > 1024:
+                    frames = np.load(frames_file)
+                    if frames is not None and frames.shape[0] >= 4:
+                        print(f"> 加载缓存帧: {video_id} ({frames.shape[0]}帧)")
+                        return torch.from_numpy(frames).float()
             except Exception as e:
                 print(f"> 加载帧文件失败 {video_id}: {e}")
+                try:
+                    os.remove(frames_file)
+                except:
+                    pass
 
-        # 2. 如果npy文件不存在或加载失败，尝试从视频文件提取
-        print(f"> 从视频提取帧: {video_id}")
+        print(f"> 提取帧: {video_id}")
+        try:
+            # ==================== 修复点4：完全仿照evaluation.py的帧提取逻辑 ====================
+            # 创建临时文件列表（仿照evaluation.py）
+            temp_list_file = f"temp_{video_id}.txt"
+            with open(temp_list_file, 'w') as f:
+                f.write(f"{video_id} {video_path}")
 
-        video_path = self.find_video_file(video_id)
+            # 使用VideoGenerator提取帧（与evaluation.py参数一致）
+            generator = VideoGenerator(temp_list_file)
+            loader = DataLoader(generator, num_workers=0, batch_size=1)
 
-        if video_path is None:
-            print(f"> 错误: 无法找到视频文件 {video_id}")
-            self.stats["video_files_missing"] += 1
-            self.stats["frames_failed"] += 1
-            return None
+            frames = None
+            for frames_batch, video_id_batch in loader:
+                frames = frames_batch[0]  # [T, H, W, C]
+                break
 
-        self.stats["video_files_found"] += 1
+            if frames is None or frames.shape[0] < 4:
+                print(f"> 视频无有效帧: {video_id}")
+                if os.path.exists(temp_list_file):
+                    os.remove(temp_list_file)
+                return None
 
-        # 从视频提取帧
-        frames = self.extract_frames_from_video(video_path, video_id)
+            # 限制最大帧数（仿照evaluation.py）
+            if frames.shape[0] > self.config.max_frames:
+                step = max(1, frames.shape[0] // self.config.max_frames)
+                indices = list(range(0, frames.shape[0], step))[:self.config.max_frames]
+                frames = frames[indices]
 
-        if frames is not None:
-            self.stats["frames_extracted_from_video"] += 1
+            # 保存为npy文件
+            frames_np = frames.cpu().numpy()
+            np.save(frames_file, frames_np)
 
-            # 保存到npy文件供下次使用
-            try:
-                np.save(frames_file, frames.numpy())
-                print(f"> 已保存帧到缓存: {frames_file}")
-            except Exception as e:
-                print(f"> 警告: 保存帧缓存失败: {e}")
+            # 清理临时文件
+            if os.path.exists(temp_list_file):
+                os.remove(temp_list_file)
+
+            # 验证保存的文件
+            if os.path.exists(frames_file):
+                saved_frames = np.load(frames_file)
+                print(f"> 保存帧完成: {video_id} ({saved_frames.shape[0]}帧)")
+            else:
+                print(f"> 警告: 帧文件未保存成功: {video_id}")
 
             return frames
-        else:
-            self.stats["frames_failed"] += 1
-            return None
-
-    def extract_frames_from_video(self, video_path: str, video_id: str) -> Optional[torch.Tensor]:
-        """从视频文件提取帧 - 完全对齐evaluation.py的load_or_extract_frames函数"""
-        try:
-            # 创建视频捕获对象
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                print(f"> 错误: 无法打开视频文件 {video_path}")
-                return None
-
-            # 获取视频信息
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            duration = total_frames / fps if fps > 0 else 0
-
-            print(f"> 视频 {video_id}: {os.path.basename(video_path)}, "
-                  f"时长: {duration:.1f}s, FPS: {fps:.1f}, 总帧数: {total_frames}")
-
-            # 论文设置：1fps（每秒1帧）
-            frame_interval = int(fps) if fps > 0 else 30
-            if frame_interval <= 0:
-                frame_interval = 30
-
-            frames = []
-            frame_count = 0
-
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
-                # 每秒取1帧（论文设置）
-                if frame_count % frame_interval == 0:
-                    # BGR转RGB
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-                    # 调整大小到224x224（论文设置：center crop 224x224）
-                    # 使用resize并保持宽高比，然后中心裁剪
-                    height, width = frame_rgb.shape[:2]
-
-                    # 计算缩放比例
-                    short_side = min(height, width)
-                    scale = 224.0 / short_side
-
-                    # 计算新尺寸
-                    new_height = int(height * scale)
-                    new_width = int(width * scale)
-
-                    # 调整大小
-                    frame_resized = cv2.resize(frame_rgb, (new_width, new_height))
-
-                    # 中心裁剪到224x224
-                    start_y = (new_height - 224) // 2
-                    start_x = (new_width - 224) // 2
-                    frame_cropped = frame_resized[start_y:start_y+224, start_x:start_x+224]
-
-                    # 归一化到[0, 1]（模型内部会进行标准化）
-                    frame_normalized = frame_cropped.astype(np.float32) / 255.0
-
-                    frames.append(frame_normalized)
-
-                frame_count += 1
-
-                # 进度显示
-                if frame_count % 1000 == 0:
-                    print(f"  处理中... {frame_count}/{total_frames} 帧", end='\r')
-
-            cap.release()
-
-            if not frames:
-                print(f"> 警告: 视频 {video_id} 无有效帧")
-                return None
-
-            # 转换为tensor [T, H, W, C]
-            frames_np = np.stack(frames, axis=0)
-            frames_tensor = torch.from_numpy(frames_np).float()
-
-            print(f"> 提取完成: {video_id}, {len(frames)} 帧, 形状: {frames_tensor.shape}")
-
-            # 确保至少有4帧
-            if frames_tensor.shape[0] < 4:
-                print(f"> 警告: 帧数不足 ({frames_tensor.shape[0]})，进行填充")
-                if frames_tensor.shape[0] > 0:
-                    repeats = (4 + frames_tensor.shape[0] - 1) // frames_tensor.shape[0]
-                    frames_tensor = frames_tensor.repeat(repeats, 1, 1, 1)[:4]
-                    print(f"> 填充后形状: {frames_tensor.shape}")
-                else:
-                    print(f"> 错误: 视频 {video_id} 无任何帧")
-                    return None
-
-            return frames_tensor
 
         except Exception as e:
-            print(f"> 提取视频帧失败 {video_id}: {e}")
+            print(f"> 提取视频 {video_id} 帧失败: {e}")
+            # 清理临时文件
+            if os.path.exists(f'temp_{video_id}.txt'):
+                try:
+                    os.remove(f'temp_{video_id}.txt')
+                except:
+                    pass
             return None
 
-    def load_features(self, video_id: str) -> Optional[torch.Tensor]:
-        """加载特征数据"""
+    def extract_features_from_frames(self, frames: torch.Tensor, video_id: str) -> torch.Tensor:
+        """
+        从帧提取特征 - 修复缓存逻辑
+        修复点：正确保存和加载特征缓存
+        """
         features_file = os.path.join(self.config.features_dir, f"{video_id}.npy")
 
+        # ==================== 修复点5：优先检查特征缓存 ====================
         if os.path.exists(features_file):
             try:
-                features_np = np.load(features_file)
-                features = torch.from_numpy(features_np).float()
-                self.stats["features_loaded_from_cache"] += 1
-                return features
+                file_size = os.path.getsize(features_file)
+                if file_size > 1024:
+                    features_np = np.load(features_file)
+                    if features_np is not None and features_np.shape[0] > 0:
+                        features = torch.from_numpy(features_np).float()
+                        print(f"> 加载缓存特征: {video_id} (形状: {features_np.shape})")
+                        return features
             except Exception as e:
                 print(f"> 加载特征文件失败 {video_id}: {e}")
-
-        return None
-
-    def save_features(self, video_id: str, features: torch.Tensor):
-        """保存特征数据"""
-        features_file = os.path.join(self.config.features_dir, f"{video_id}.npy")
-        os.makedirs(os.path.dirname(features_file), exist_ok=True)
+                try:
+                    os.remove(features_file)
+                except:
+                    pass
 
         try:
-            np.save(features_file, features.numpy())
-            print(f"> 保存特征到缓存: {video_id}")
-        except Exception as e:
-            print(f"> 保存特征文件失败 {video_id}: {e}")
+            # ==================== 修复点6：正确提取特征 ====================
+            if frames.dim() == 3:
+                frames = frames.unsqueeze(0)  # [1, T, C, H, W]
 
-    def extract_features(self, frames: torch.Tensor) -> torch.Tensor:
-        """提取特征 - 完全对齐evaluation.py的load_or_extract_features"""
-        if frames is None or frames.shape[0] == 0:
-            print("> 错误: 无帧数据")
-            self.stats["features_failed"] += 1
-            return None
+            # 分批提取特征
+            features_list = []
+            batch_size = min(self.config.batch_size, frames.shape[1])
 
-        print(f"> 提取特征，帧数: {frames.shape[0]}")
+            for i in range(0, frames.shape[1], batch_size):
+                end_idx = min(i + batch_size, frames.shape[1])
 
-        features_list = []
-        batch_size = model_config.batch_size
+                if i >= end_idx:
+                    break
 
-        for i in range(0, frames.shape[0], batch_size):
-            batch = frames[i:i + batch_size]
+                # 获取当前批次的帧
+                batch_frames = frames[:, i:end_idx]  # [1, batch_size, C, H, W]
 
-            # 确保输入格式正确 [B, H, W, C]
-            if len(batch.shape) == 3:  # [H, W, C]
-                batch = batch.unsqueeze(0)
-            elif len(batch.shape) == 4 and batch.shape[1] == 3:  # [B, C, H, W]
-                batch = batch.permute(0, 2, 3, 1)
+                if batch_frames.shape[1] == 0:
+                    continue
 
-            batch = batch.to(self.device)
+                # 重塑为ViSiL期望的格式 [batch_size, C, H, W]
+                batch_frames = batch_frames.squeeze(0)
 
-            if batch.shape[0] > 0:
+                # 确保维度正确
+                if batch_frames.dim() == 3:
+                    batch_frames = batch_frames.unsqueeze(0)
+
+                batch_frames = batch_frames.to(self.device).float()
+
                 with torch.no_grad():
-                    try:
-                        batch_features = self.model.extract_features(batch)
-                        features_list.append(batch_features.cpu())
-                    except Exception as e:
-                        print(f"> 特征提取失败: {e}")
-                        self.stats["features_failed"] += 1
-                        # 不再返回随机特征，返回None
-                        return None
+                    batch_features = self.model.extract_features(batch_frames)
 
-                # 清理内存
-                del batch
-                self.cleanup_memory()
+                features_list.append(batch_features.cpu())
 
-        if features_list:
+            if not features_list:
+                print(f"> 未提取到特征: {video_id}")
+                return None
+
+            # 合并所有批次的特征
             features = torch.cat(features_list, dim=0)
-            self.stats["features_extracted"] += 1
-            print(f"> 特征提取完成, 形状: {features.shape}")
 
-            # 验证特征维度
-            expected_dim = 512 if model_config.pretrained else 3840
-            if features.shape[-1] != expected_dim:
-                print(f"> 警告: 特征维度不匹配! 期望: {expected_dim}, 实际: {features.shape[-1]}")
+            # 保存特征
+            features_np = features.cpu().numpy()
+            np.save(features_file, features_np)
+
+            # 验证保存的文件
+            if os.path.exists(features_file):
+                saved_features = np.load(features_file)
+                print(f"> 保存特征完成: {video_id} (形状: {saved_features.shape})")
+            else:
+                print(f"> 警告: 特征文件未保存成功: {video_id}")
 
             return features
-        else:
-            print("> 错误: 特征列表为空")
-            self.stats["features_failed"] += 1
-            return None
-
-    def calculate_similarity(self, query_features: torch.Tensor,
-                             db_features: torch.Tensor) -> float:
-        """计算相似度"""
-        if query_features is None or db_features is None:
-            print("> 错误: 特征为空")
-            return -1.0
-
-        try:
-            with torch.no_grad():
-                # 确保特征在正确的设备上，并添加批次维度
-                query_features = query_features.to(self.device)
-                db_features = db_features.to(self.device)
-
-                # 检查维度，确保是3D [frames, regions, features]
-                if query_features.dim() == 2:
-                    query_features = query_features.unsqueeze(0)  # 添加region维度
-                if db_features.dim() == 2:
-                    db_features = db_features.unsqueeze(0)  # 添加region维度
-
-                if query_features.dim() == 3:
-                    query_features = query_features.unsqueeze(0)  # 添加批次维度
-                if db_features.dim() == 3:
-                    db_features = db_features.unsqueeze(0)  # 添加批次维度
-
-                # 计算相似度
-                similarity = self.model.calculate_video_similarity(query_features, db_features)
-
-                # 确保输出是标量
-                if isinstance(similarity, torch.Tensor):
-                    similarity = similarity.item()
-
-                return float(similarity)
 
         except Exception as e:
-            print(f"> 计算相似度失败: {e}")
+            print(f"> 提取特征失败 {video_id}: {e}")
             traceback.print_exc()
-            return -1.0
+            return None
 
-    def calculate_average_precision(self, similarities: Dict[str, float],
-                                    relevant_set: Set[str]) -> float:
-        """计算Average Precision"""
-        if not relevant_set:
-            return 0.0
+    def process_videos(self, video_ids: list, video_dir: str, pattern: str) -> dict:
+        """处理视频列表 - 提取特征"""
+        features = {}
+        failed_videos = []
 
-        # 按相似度排序
-        sorted_results = sorted(similarities.items(), key=lambda x: x[1], reverse=True)
+        print(f"> 处理视频 ({len(video_ids)}个)")
 
-        precision_at_k = []
-        num_relevant = 0
-
-        for k, (video_id, score) in enumerate(sorted_results, 1):
-            if video_id in relevant_set:
-                num_relevant += 1
-                precision = num_relevant / k
-                precision_at_k.append(precision)
-
-        if not precision_at_k:
-            return 0.0
-
-        # 计算AP
-        ap = sum(precision_at_k) / len(relevant_set)
-        return ap
-
-    def save_checkpoint(self, checkpoint_name: str, data: Dict):
-        """保存检查点"""
-        checkpoint_file = os.path.join(self.checkpoint_dir, f"{checkpoint_name}.json")
-        with open(checkpoint_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        print(f"> 检查点已保存: {checkpoint_file}")
-
-    def load_checkpoint(self, checkpoint_name: str) -> Optional[Dict]:
-        """加载检查点"""
-        checkpoint_file = os.path.join(self.checkpoint_dir, f"{checkpoint_name}.json")
-
-        if os.path.exists(checkpoint_file):
+        for idx, video_id in enumerate(tqdm(video_ids, desc="处理视频")):
             try:
-                with open(checkpoint_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                print(f"> 检查点已加载: {checkpoint_file}")
-                return data
+                # 构建视频路径
+                video_path = os.path.join(video_dir, pattern.format(id=video_id))
+
+                # 检查文件是否存在
+                if not os.path.exists(video_path):
+                    # 尝试其他可能的后缀
+                    for ext in ['.mp4', '.avi', '.mkv', '.mov', '.webm']:
+                        alt_path = video_path.rsplit('.', 1)[0] + ext
+                        if os.path.exists(alt_path):
+                            video_path = alt_path
+                            break
+
+                if not os.path.exists(video_path):
+                    print(f"> 视频文件不存在: {video_id}")
+                    failed_videos.append(video_id)
+                    continue
+
+                # 提取帧
+                frames = self.extract_frames_from_video(video_path, video_id)
+                if frames is None or frames.shape[0] < 4:
+                    print(f"> 视频 {video_id} 帧数不足")
+                    failed_videos.append(video_id)
+                    continue
+
+                # 提取特征
+                video_features = self.extract_features_from_frames(frames, video_id)
+                if video_features is None:
+                    print(f"> 视频 {video_id} 特征提取失败")
+                    failed_videos.append(video_id)
+                    continue
+
+                features[video_id] = video_features
+
+                # 内存清理
+                if (idx + 1) % 10 == 0:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
             except Exception as e:
-                print(f"> 加载检查点失败: {e}")
+                print(f"> 处理视频 {video_id} 失败: {str(e)[:200]}")
+                failed_videos.append(video_id)
 
-        return None
+        print(f"> 视频处理完成: 成功 {len(features)}, 失败 {len(failed_videos)}")
+        return features, failed_videos
 
-    def delete_checkpoint(self, checkpoint_name: str):
-        """删除检查点"""
-        checkpoint_file = os.path.join(self.checkpoint_dir, f"{checkpoint_name}.json")
-        if os.path.exists(checkpoint_file):
-            os.remove(checkpoint_file)
-            print(f"> 检查点已删除: {checkpoint_file}")
+    def calculate_similarities(self, query_features: dict, database_ids: list) -> dict:
+        """计算相似度 - 简化版本"""
+        print(f"\n" + "=" * 60)
+        print("计算相似度")
+        print("=" * 60)
+        print(f"查询视频数: {len(query_features)}")
+        print(f"数据库视频数: {len(database_ids)}")
 
-    def print_detailed_stats(self):
-        """打印详细的统计信息"""
-        print("\n" + "="*60)
-        print("数据处理详细统计")
-        print("="*60)
+        similarities = {}
+        batch_size = self.config.query_batch_size
 
-        total_frames_attempted = (self.stats["frames_loaded_from_cache"] +
-                                  self.stats["frames_extracted_from_video"] +
-                                  self.stats["frames_failed"])
+        # 分批处理查询视频
+        query_ids = list(query_features.keys())
 
-        total_features_attempted = (self.stats["features_loaded_from_cache"] +
-                                    self.stats["features_extracted"] +
-                                    self.stats["features_failed"])
+        for batch_start in range(0, len(query_ids), batch_size):
+            batch_end = min(batch_start + batch_size, len(query_ids))
+            batch_query_ids = query_ids[batch_start:batch_end]
 
-        print(f"视频处理统计:")
-        print(f"  尝试处理视频总数: {self.stats['total_videos']}")
-        print(f"  找到视频文件数: {self.stats['video_files_found']}")
-        print(f"  缺失视频文件数: {self.stats['video_files_missing']}")
+            print(f"> 处理查询批次 {batch_start // batch_size + 1}/{(len(query_ids) + batch_size - 1) // batch_size}")
 
-        print(f"\n帧数据统计:")
-        print(f"  从缓存(npy)加载: {self.stats['frames_loaded_from_cache']}")
-        print(f"  从视频文件提取: {self.stats['frames_extracted_from_video']}")
-        print(f"  帧提取失败: {self.stats['frames_failed']}")
+            for query_id in tqdm(batch_query_ids, desc="计算相似度"):
+                if query_id not in query_features:
+                    continue
 
-        if total_frames_attempted > 0:
-            cache_hit_rate = self.stats['frames_loaded_from_cache'] / total_frames_attempted * 100
-            extraction_rate = self.stats['frames_extracted_from_video'] / total_frames_attempted * 100
-            failure_rate = self.stats['frames_failed'] / total_frames_attempted * 100
+                query_feat = query_features[query_id].to(self.device)
+                similarities[query_id] = {}
 
-            print(f"  缓存命中率: {cache_hit_rate:.1f}%")
-            print(f"  视频提取率: {extraction_rate:.1f}%")
-            print(f"  失败率: {failure_rate:.1f}%")
+                # 分批处理数据库视频
+                db_batch_size = 100
+                for db_start in range(0, len(database_ids), db_batch_size):
+                    db_end = min(db_start + db_batch_size, len(database_ids))
+                    db_batch_ids = database_ids[db_start:db_end]
 
-        print(f"\n特征数据统计:")
-        print(f"  从缓存加载: {self.stats['features_loaded_from_cache']}")
-        print(f"  重新提取: {self.stats['features_extracted']}")
-        print(f"  特征提取失败: {self.stats['features_failed']}")
+                    # 批量加载数据库特征
+                    db_batch_features = {}
+                    for db_id in db_batch_ids:
+                        features_file = os.path.join(self.config.features_dir, f"{db_id}.npy")
+                        if os.path.exists(features_file):
+                            try:
+                                features_np = np.load(features_file)
+                                if features_np is not None and features_np.shape[0] > 0:
+                                    db_batch_features[db_id] = torch.from_numpy(features_np).float()
+                            except:
+                                pass
 
-        if total_features_attempted > 0:
-            feature_cache_rate = self.stats['features_loaded_from_cache'] / total_features_attempted * 100
-            feature_extraction_rate = self.stats['features_extracted'] / total_features_attempted * 100
-            feature_failure_rate = self.stats['features_failed'] / total_features_attempted * 100
+                    # 计算相似度
+                    for db_id, db_feat in db_batch_features.items():
+                        try:
+                            # 确保有批次维度
+                            q_feat_batch = query_feat.unsqueeze(0) if query_feat.dim() == 2 else query_feat
+                            db_feat_batch = db_feat.unsqueeze(0).to(self.device) if db_feat.dim() == 2 else db_feat.to(
+                                self.device)
 
-            print(f"  特征缓存率: {feature_cache_rate:.1f}%")
-            print(f"  特征提取率: {feature_extraction_rate:.1f}%")
-            print(f"  特征失败率: {feature_failure_rate:.1f}%")
+                            with torch.no_grad():
+                                sim = self.model.calculate_video_similarity(q_feat_batch, db_feat_batch)
 
-        print("\n处理效率:")
-        if self.stats['video_files_found'] > 0:
-            video_found_rate = self.stats['video_files_found'] / self.stats['total_videos'] * 100
-            print(f"  视频文件找到率: {video_found_rate:.1f}%")
+                            similarities[query_id][db_id] = float(sim.item())
+                        except Exception as e:
+                            print(f"> 计算相似度失败 {query_id}-{db_id}: {str(e)[:100]}")
+                            similarities[query_id][db_id] = 0.0
 
-        print("="*60)
+        return similarities
 
-    def get_processing_summary(self):
-        """获取处理摘要"""
+    def evaluate(self) -> dict:
+        """执行完整的评估流程"""
+        start_time = time.time()
+
+        print("=" * 60)
+        print(f"开始评估: {self.config.dataset}")
+        print(f"特征配置: {self.config.feature_config.name}")
+        print(f"实验ID: {self.config.experiment_id}")
+        print("=" * 60)
+
+        try:
+            # 获取视频ID
+            query_ids = self.dataset.get_queries()
+            database_ids = self.dataset.get_database()
+
+            print(f"> 查询视频数: {len(query_ids)}")
+            print(f"> 数据库视频数: {len(database_ids)}")
+
+            # ========== 第一阶段：处理查询视频 ==========
+            print("\n" + "=" * 60)
+            print("第一阶段：处理查询视频")
+            print("=" * 60)
+
+            query_features, query_failed = self.process_videos(
+                query_ids,
+                self.config.video_dir,
+                self.config.video_pattern
+            )
+
+            if not query_features:
+                raise ValueError("没有成功提取查询特征")
+
+            # ========== 第二阶段：处理数据库视频 ==========
+            print("\n" + "=" * 60)
+            print("第二阶段：处理数据库视频")
+            print("=" * 60)
+
+            # 只处理数据库视频，但不加载到内存
+            database_features, database_failed = self.process_videos(
+                database_ids,
+                self.config.video_dir,
+                self.config.video_pattern
+            )
+
+            # ========== 第三阶段：计算相似度 ==========
+            print("\n" + "=" * 60)
+            print("第三阶段：计算相似度")
+            print("=" * 60)
+
+            similarities = self.calculate_similarities(query_features, database_ids)
+
+            # ========== 第四阶段：评估结果 ==========
+            print("\n" + "=" * 60)
+            print("第四阶段：评估结果")
+            print("=" * 60)
+
+            evaluation_results = self.dataset.evaluate(similarities)
+
+            # ========== 第五阶段：保存结果 ==========
+            print("\n" + "=" * 60)
+            print("第五阶段：保存结果")
+            print("=" * 60)
+
+            results = self.save_results(similarities, evaluation_results, start_time)
+
+            total_time = time.time() - start_time
+            print(f"\n> 评估完成!")
+            print(f"> 总耗时: {total_time:.2f} 秒 ({total_time / 60:.1f} 分钟)")
+
+            return results
+
+        except Exception as e:
+            print(f"> 评估失败: {e}")
+            traceback.print_exc()
+            raise
+
+    def save_results(self, similarities: dict, evaluation_results: dict, start_time: float) -> dict:
+        """保存结果文件"""
+        # 保存完整相似度结果
+        result_file = os.path.join(self.config.output_dir, "similarities.json")
+        try:
+            with open(result_file, 'w') as f:
+                json.dump(similarities, f, separators=(',', ':'))
+            print(f"> 相似度结果已保存: {result_file}")
+        except Exception as e:
+            print(f"> 保存相似度结果失败: {e}")
+
+        # 保存排序版本
+        sorted_file = os.path.join(self.config.output_dir, "sorted_results.json")
+        try:
+            sorted_results = {}
+            for query_id, query_sims in similarities.items():
+                sorted_items = sorted(query_sims.items(), key=lambda x: x[1], reverse=True)
+                sorted_results[query_id] = dict(sorted_items[:100])
+
+            with open(sorted_file, 'w') as f:
+                json.dump(sorted_results, f, indent=2)
+            print(f"> 排序结果已保存: {sorted_file}")
+        except Exception as e:
+            print(f"> 保存排序结果失败: {e}")
+
+        # 保存评估结果
+        eval_file = os.path.join(self.config.output_dir, "evaluation_results.json")
+        try:
+            with open(eval_file, 'w') as f:
+                json.dump(evaluation_results, f, indent=2)
+            print(f"> 评估结果已保存: {eval_file}")
+        except Exception as e:
+            print(f"> 保存评估结果失败: {e}")
+
+        total_time = time.time() - start_time
+
+        # 返回汇总结果
         return {
-            "total_videos": self.stats["total_videos"],
-            "frames_from_cache": self.stats["frames_loaded_from_cache"],
-            "frames_from_video": self.stats["frames_extracted_from_video"],
-            "video_files_found": self.stats["video_files_found"],
-            "video_files_missing": self.stats["video_files_missing"]
+            "config": self.config.feature_config.name,
+            "experiment_id": self.config.experiment_id,
+            "dataset": self.config.dataset,
+            "evaluation": evaluation_results,
+            "total_time": total_time,
+            "output_dir": self.config.output_dir
         }

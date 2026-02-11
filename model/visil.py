@@ -119,8 +119,7 @@ class Feature_Extractor(nn.Module):
 
         # 验证归一化是否正确
         norms = torch.norm(x, dim=-1)
-        print(f"> 特征归一化检查: 平均范数={norms.mean():.4f}, 最小范数={norms.min():.4f}, 最大范数={norms.max():.4f}")
-        
+
         return x
 
     def forward(self, x):
@@ -228,7 +227,7 @@ class ViSiLHead(nn.Module):
 
         # 如果有视频比较器，则应用
         if self.video_comperator is not None:
-            print(f"  应用视频比较器...")
+            # print(f"  应用视频比较器...")
             sim = self.visil_output(sim)
             # print(f"  视频比较器输出统计: 平均={sim.mean():.4f}, 最小={sim.min():.4f}, 最大={sim.max():.4f}")
 
@@ -237,7 +236,7 @@ class ViSiLHead(nn.Module):
 
         # 计算最终的视频相似度
         result = self.v2v_sim(sim)
-        print(f"  最终相似度: {result}")
+        # print(f"  最终相似度: {result}")
         
         return result
 
@@ -313,36 +312,15 @@ class ViSiL(nn.Module):
         print("="*60)
 
     def load_pretrained_weights(self, symmetric=False, dims=3840):
-        """加载预训练权重"""
+        """加载预训练权重，失败时抛出异常"""
         print("> 加载预训练权重...")
-        
         try:
-            if symmetric:
-                # 对称版本
-                print("> 加载ViSiLsym权重...")
-                weight_url = 'http://ndd.iti.gr/visil/visil_symmetric.pth'
-            else:
-                # 非对称版本 (ViSiLv)
-                print("> 加载ViSiLv权重...")
-                weight_url = 'http://ndd.iti.gr/visil/visil.pth'
-            
-            # 加载权重
-            state_dict = torch.hub.load_state_dict_from_url(
-                weight_url,
-                map_location='cpu',
-                progress=True
-            )
-            
-            if state_dict:
-                # 加载权重
-                self.visil_head.load_state_dict(state_dict)
-                print(f"> ✓ 预训练权重加载成功 (维度: {dims})")
-            else:
-                print("> ⚠️ 预训练权重加载失败，使用随机初始化")
-        
+            url = 'http://ndd.iti.gr/visil/visil_symmetric.pth' if symmetric else 'http://ndd.iti.gr/visil/visil.pth'
+            state_dict = torch.hub.load_state_dict_from_url(url, map_location='cpu', progress=True)
+            self.visil_head.load_state_dict(state_dict)
+            print(f"> ✓ 预训练权重加载成功 ({'对称' if symmetric else '非对称'})")
         except Exception as e:
-            print(f"> ✗ 预训练权重加载失败: {e}")
-            print("> 使用随机初始化")
+            raise RuntimeError(f"预训练权重加载失败，请检查网络或URL: {e}") from e
 
     def calculate_video_similarity(self, query, target):
         return self.visil_head(query, target)
