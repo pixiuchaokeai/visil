@@ -17,7 +17,7 @@ from tqdm import tqdm
 import shutil
 
 # 导入自定义模块
-from model.visil import ViSiL
+from model.visil1 import ViSiL
 from torch.utils.data import DataLoader
 from datasets.generators import VideoGenerator
 

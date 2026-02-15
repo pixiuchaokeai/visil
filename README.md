@@ -113,7 +113,7 @@ Here is a toy example to run ViSiL on any data.
 ```python
 import torch
 
-from model.visil import ViSiL
+from model.visil1 import ViSiL
 from utils import load_video
 
 # Load the two videos from the video files

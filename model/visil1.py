@@ -1,6 +1,6 @@
-# visil.py - 修正为完整维度版本
+# visil1.py - 修正为完整维度版本
 """
-visil.py - 修正为完整维度版本
+visil1.py - 修正为完整维度版本
 ViSiL_v使用完整的L3-iMAC9x特征（9×3840维），不降维
 """
 
@@ -12,7 +12,7 @@ import warnings
 
 warnings.filterwarnings("ignore")
 
-from model.layers import VideoNormalizer, RMAC, PCA, Attention, L2Constrain
+from model.layers1 import VideoNormalizer, RMAC, PCA, Attention, L2Constrain
 from model.similarities import TensorDot, ChamferSimilarity, VideoComperator
 
 
@@ -263,7 +263,7 @@ class ViSiLHead(nn.Module):
 
 
 class ViSiL(nn.Module):
-    def __init__(self, network='resnet50', pretrained=False, dims=3840,
+    def __init__(self, network='resnet50', pretrained=False, dims=512, # 3840
                  whiteninig=True, attention=True, video_comperator=True, symmetric=False):
         super(ViSiL, self).__init__()
         
@@ -281,10 +281,10 @@ class ViSiL(nn.Module):
         print("="*60)
         
         # 根据论文，ViSiL_v使用完整维度，不降维
-        if dims != 3840 and pretrained:
-            print(f"> 警告: 预训练ViSiL_v模型使用3840维特征")
-            print(f"> 将维度从{dims}调整为3840")
-            dims = 3840
+        # if dims != 3840 and pretrained:
+        #     print(f"> 警告: 预训练ViSiL_v模型使用3840维特征")
+        #     print(f"> 将维度从{dims}调整为3840")
+        #     dims = 3840
         
         # 使用完整维度
         use_full_dim = (dims == 3840)
