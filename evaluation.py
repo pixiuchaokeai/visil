@@ -6,6 +6,7 @@ import gc
 import numpy as np
 from tqdm import tqdm
 import time
+import traceback
 
 from model.visil import ViSiL
 from torch.utils.data import DataLoader
@@ -13,14 +14,26 @@ from datasets.generators import VideoGenerator
 
 
 def extract_frames_from_video(video_path: str, video_id: str, frames_dir: str, max_frames: int = 50):
-    """从视频文件提取帧并保存为npy，优先使用缓存"""
+    """从视频文件提取帧并保存为npy，优先使用缓存，并统一保存为 [T, C, H, W] 格式"""
     frames_file = os.path.join(frames_dir, f"{video_id}.npy")
 
     if os.path.exists(frames_file):
         try:
-            frames = np.load(frames_file)
-            if frames.shape[0] >= 4:
-                return torch.from_numpy(frames).float()
+            frames_np = np.load(frames_file)
+            frames = torch.from_numpy(frames_np).float()
+            # 验证帧维度并统一为 [T, C, H, W]
+            if frames.dim() == 4:
+                if frames.shape[1] == 3:  # 已经是 [T, C, H, W]
+                    if frames.shape[2] == frames.shape[3] == 224:
+                        return frames
+                elif frames.shape[3] == 3:  # 是 [T, H, W, C]
+                    frames = frames.permute(0, 3, 1, 2).contiguous()
+                    if frames.shape[2] == frames.shape[3] == 224:
+                        np.save(frames_file, frames.cpu().numpy())
+                        return frames
+            # 若维度不符合，删除并重新提取
+            print(f"> 帧文件 {video_id}.npy 维度异常 {frames.shape}，重新提取")
+            os.remove(frames_file)
         except Exception:
             try:
                 os.remove(frames_file)
@@ -28,6 +41,11 @@ def extract_frames_from_video(video_path: str, video_id: str, frames_dir: str, m
                 pass
 
     try:
+        # 检查视频文件是否存在
+        if not os.path.exists(video_path):
+            print(f"> 视频文件不存在: {video_path}")
+            return None
+
         temp_list_file = f"temp_{video_id}.txt"
         with open(temp_list_file, 'w') as f:
             f.write(f"{video_id} {video_path}")
@@ -37,10 +55,11 @@ def extract_frames_from_video(video_path: str, video_id: str, frames_dir: str, m
 
         frames = None
         for frames_batch, _ in loader:
-            frames = frames_batch[0]
+            frames = frames_batch[0]  # [T, C, H, W]
             break
 
         if frames is None or frames.shape[0] < 4:
+            print(f"> 视频 {video_id} 帧数不足 ({frames.shape[0] if frames is not None else 0})")
             if os.path.exists(temp_list_file):
                 os.remove(temp_list_file)
             return None
@@ -57,6 +76,7 @@ def extract_frames_from_video(video_path: str, video_id: str, frames_dir: str, m
 
     except Exception as e:
         print(f"> 提取视频 {video_id} 帧失败: {e}")
+        traceback.print_exc()
         if os.path.exists(temp_list_file):
             try:
                 os.remove(temp_list_file)
@@ -67,13 +87,20 @@ def extract_frames_from_video(video_path: str, video_id: str, frames_dir: str, m
 
 def extract_features_from_frames(model, frames: torch.Tensor, video_id: str, features_dir: str,
                                  device: torch.device, batch_size: int = 4):
-    """从帧数据提取特征并保存为npy，优先使用缓存"""
+    """从帧数据提取特征并保存为npy，优先使用缓存，并验证特征维度（第二维必须为9）"""
     features_file = os.path.join(features_dir, f"{video_id}.npy")
 
+    # 如果存在缓存文件，尝试加载并验证维度
     if os.path.exists(features_file):
         try:
             features_np = np.load(features_file)
-            return torch.from_numpy(features_np).float()
+            features = torch.from_numpy(features_np).float()
+            # 验证特征维度：应为 [帧数, 9, dims]（第二维必须为9）
+            if features.dim() == 3 and features.shape[1] == 9:
+                return features
+            else:
+                print(f"> 特征文件 {video_id}.npy 维度异常 {features.shape}（期望第二维为9），重新提取")
+                os.remove(features_file)
         except Exception:
             try:
                 os.remove(features_file)
@@ -81,6 +108,9 @@ def extract_features_from_frames(model, frames: torch.Tensor, video_id: str, fea
                 pass
 
     try:
+        # 确保帧为 [T, C, H, W] 格式（通道在前）
+        if frames.dim() == 4 and frames.shape[1] != 3 and frames.shape[3] == 3:
+            frames = frames.permute(0, 3, 1, 2).contiguous()
         if frames.dim() == 3:
             frames = frames.unsqueeze(0)
 
@@ -90,8 +120,16 @@ def extract_features_from_frames(model, frames: torch.Tensor, video_id: str, fea
             end = min(i + batch_size, total_frames)
             batch = frames[i:end].to(device).float()
 
-            if len(batch.shape) == 3:
-                batch = batch.unsqueeze(0)
+            # [修改点] 转换为模型期望的 [B, H, W, C] 格式
+            if batch.dim() == 4:
+                # 如果当前是 [B, C, H, W]（通道在第二维）
+                if batch.shape[1] == 3:
+                    batch = batch.permute(0, 2, 3, 1).contiguous()  # -> [B, H, W, C]
+                # 如果已经是 [B, H, W, C]（通道在最后一维），则保持
+                # 否则尝试转换
+                elif batch.shape[3] != 3:
+                    # 尝试假设是 [B, C, H, W] 但通道数可能不是3？简单转换
+                    batch = batch.permute(0, 2, 3, 1).contiguous()
 
             with torch.no_grad():
                 batch_features = model.extract_features(batch)
@@ -101,18 +139,26 @@ def extract_features_from_frames(model, frames: torch.Tensor, video_id: str, fea
                 gc.collect()
 
         if not features_list:
+            print(f"> 视频 {video_id} 特征提取为空")
             return None
 
-        features = torch.cat(features_list, dim=0)
+        features = torch.cat(features_list, dim=0)  # [总帧数, 9, dims]
+
+        # 验证特征维度：第二维必须为9（区域数）
+        if features.dim() != 3 or features.shape[1] != 9:
+            print(f"> 提取的特征 {video_id} 维度异常: {features.shape}，期望第二维为9")
+            return None
+
         np.save(features_file, features.cpu().numpy())
         return features
 
     except Exception as e:
         print(f"> 提取特征失败 {video_id}: {e}")
+        traceback.print_exc()
         return None
 
 
-def process_query_videos(query_ids, video_dir, pattern, model, device,
+def process_query_videos(query_ids, id_to_path, model, device,
                          frames_dir, features_dir, batch_size=4, max_frames=50):
     """处理查询视频，返回特征字典和失败列表"""
     query_features = {}
@@ -121,14 +167,16 @@ def process_query_videos(query_ids, video_dir, pattern, model, device,
     print(f"> 处理查询视频 ({len(query_ids)}个)")
     for idx, query_id in enumerate(tqdm(query_ids, desc="查询视频")):
         try:
-            video_path = os.path.join(video_dir, pattern.format(id=query_id))
+            # 获取视频路径：优先从 id_to_path 字典获取
+            if query_id in id_to_path:
+                video_path = id_to_path[query_id]
+            else:
+                # 若字典中无此 ID，记录失败
+                failed_queries.append(query_id)
+                continue
+
             if not os.path.exists(video_path):
-                for ext in ['.mp4', '.avi', '.mkv', '.mov', '.webm']:
-                    alt_path = video_path.rsplit('.', 1)[0] + ext
-                    if os.path.exists(alt_path):
-                        video_path = alt_path
-                        break
-            if not os.path.exists(video_path):
+                print(f"> 视频文件不存在: {video_path}")
                 failed_queries.append(query_id)
                 continue
 
@@ -151,6 +199,7 @@ def process_query_videos(query_ids, video_dir, pattern, model, device,
                     torch.cuda.empty_cache()
 
         except Exception as e:
+            print(f"> 处理查询 {query_id} 异常: {e}")
             failed_queries.append(query_id)
 
     print(f"> 查询视频完成: 成功 {len(query_features)}, 失败 {len(failed_queries)}")
@@ -163,9 +212,14 @@ def main():
                         choices=["FIVR-200K", "FIVR-5K", "CC_WEB_VIDEO", "SVD", "EVVE"],
                         help='评估数据集名称')
     parser.add_argument('--video_dir', type=str, default='datasets/FIVR-200K',
-                        help='视频文件根目录')
+                        help='视频文件根目录（当不使用列表文件时使用）')
     parser.add_argument('--pattern', type=str, default='{id}.mp4',
-                        help='视频文件名模式')
+                        help='视频文件名模式（当不使用列表文件时使用）')
+    # 新增视频列表文件参数，与 calculate_similarity.py 保持一致
+    parser.add_argument('--query_file', type=str, default=None,
+                        help='查询视频列表文件（每行：id 路径），优先于 video_dir+pattern')
+    parser.add_argument('--database_file', type=str, default=None,
+                        help='数据库视频列表文件（每行：id 路径），优先于 video_dir+pattern')
     parser.add_argument('--max_frames', type=int, default=50,
                         help='每个视频最大帧数')
     parser.add_argument('--batch_sz', type=int, default=4,
@@ -174,12 +228,12 @@ def main():
                         help='GPU ID')
     parser.add_argument('--cpu_only', action='store_true',
                         help='强制使用CPU')
-    parser.add_argument('--similarity_function', type=str, default='chamfer',
+    parser.add_argument('--similarity_function', type=str, default='symmetric_chamfer',
                         choices=["chamfer", "symmetric_chamfer"],
                         help='相似度函数')
     parser.add_argument('--frames_dir', type=str, default='output/frames',
                         help='帧文件目录')
-    parser.add_argument('--features_dir', type=str, default='output/features1/ViSiL_v',
+    parser.add_argument('--features_dir', type=str, default='output/features1',
                         help='特征文件目录')
     parser.add_argument('--output_dir', type=str, default='output',
                         help='输出目录')
@@ -208,28 +262,92 @@ def main():
         print(f"错误: 模型加载失败 - {e}")
         return
 
-    try:
-        if 'FIVR' in args.dataset:
-            from datasets import FIVR
-            version = args.dataset.split('-')[1].lower() if '-' in args.dataset else '5k'
-            dataset = FIVR(version=version)
-        else:
-            raise ValueError(f"未知数据集: {args.dataset}")
-        print(f"> 数据集: {dataset.name}")
-        query_ids = dataset.get_queries()
-        database_ids = dataset.get_database()
-        print(f"> 查询: {len(query_ids)}, 数据库: {len(database_ids)}")
-    except Exception as e:
-        print(f"> 数据集加载失败: {e}")
-        return
+    # 构建 id 到路径的映射
+    id_to_path = {}
+    query_ids = []
+    database_ids = []
+
+    # 如果提供了查询列表文件，则从文件读取 ID 和路径
+    if args.query_file:
+        try:
+            with open(args.query_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            vid = parts[0]
+                            path = ' '.join(parts[1:])
+                            id_to_path[vid] = path
+                            query_ids.append(vid)
+            print(f"> 从 {args.query_file} 读取到 {len(query_ids)} 个查询视频")
+        except Exception as e:
+            print(f"> 读取查询列表文件失败: {e}")
+            return
+    else:
+        # 否则从数据集模块获取 ID，并准备用 pattern 拼接路径
+        try:
+            if 'FIVR' in args.dataset:
+                from datasets import FIVR
+                version = args.dataset.split('-')[1].lower() if '-' in args.dataset else '5k'
+                dataset = FIVR(version=version)
+            else:
+                raise ValueError(f"未知数据集: {args.dataset}")
+            print(f"> 数据集: {dataset.name}")
+            query_ids = dataset.get_queries()
+            database_ids = dataset.get_database()
+            print(f"> 查询: {len(query_ids)}, 数据库: {len(database_ids)} (将使用 video_dir+pattern 拼接路径)")
+        except Exception as e:
+            print(f"> 数据集加载失败: {e}")
+            return
+
+    # 如果提供了数据库列表文件，同样读取并覆盖 database_ids
+    if args.database_file:
+        try:
+            db_ids_from_file = []
+            with open(args.database_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            vid = parts[0]
+                            path = ' '.join(parts[1:])
+                            id_to_path[vid] = path
+                            db_ids_from_file.append(vid)
+            database_ids = db_ids_from_file
+            print(f"> 从 {args.database_file} 读取到 {len(database_ids)} 个数据库视频")
+        except Exception as e:
+            print(f"> 读取数据库列表文件失败: {e}")
+            return
+
+    # 若使用 pattern 拼接方式，需要为每个 ID 构建路径（当 id_to_path 中不存在时）
+    for vid in query_ids + database_ids:
+        if vid not in id_to_path:
+            # 使用 video_dir + pattern 拼接
+            path_candidate = os.path.join(args.video_dir, args.pattern.format(id=vid))
+            # 尝试常见扩展名
+            if not os.path.exists(path_candidate):
+                base = os.path.splitext(path_candidate)[0]
+                found = False
+                for ext in ['.mp4', '.avi', '.mkv', '.mov', '.webm']:
+                    alt_path = base + ext
+                    if os.path.exists(alt_path):
+                        path_candidate = alt_path
+                        found = True
+                        break
+                if not found:
+                    # 如果都不存在，路径仍为原拼接路径，后续会检查失败
+                    pass
+            id_to_path[vid] = path_candidate
 
     # ---------- 第一阶段：处理查询 ----------
     print("\n" + "=" * 60)
     print("第一阶段：处理查询视频")
     print("=" * 60)
     query_features, q_failed = process_query_videos(
-        query_ids, args.video_dir, args.pattern,
-        model, device, args.frames_dir, args.features_dir,
+        query_ids, id_to_path, model, device,
+        args.frames_dir, args.features_dir,
         args.batch_sz, args.max_frames
     )
     if not query_features:
@@ -243,6 +361,7 @@ def main():
     checkpoint_file = os.path.join(args.output_dir, "checkpoint.json")
     similarities = {}
     processed_db = set()
+    failed_db = set()
 
     if os.path.exists(checkpoint_file):
         try:
@@ -259,24 +378,23 @@ def main():
         print("> 所有数据库视频已处理")
     else:
         print(f"> 待处理 {len(db_to_process)} 个数据库视频")
-        # [修改点] 使用单个全局进度条，避免多个进度条刷屏
         pbar = tqdm(total=len(db_to_process), desc="数据库视频", unit="vid")
         for idx, db_id in enumerate(db_to_process):
             try:
-                video_path = os.path.join(args.video_dir, args.pattern.format(id=db_id))
-                if not os.path.exists(video_path):
-                    for ext in ['.mp4', '.avi', '.mkv', '.mov', '.webm']:
-                        alt_path = video_path.rsplit('.', 1)[0] + ext
-                        if os.path.exists(alt_path):
-                            video_path = alt_path
-                            break
-                if not os.path.exists(video_path):
-                    processed_db.add(db_id)
-                    pbar.update(1)
-                    continue
+                video_path = id_to_path.get(db_id)
+                if not video_path or not os.path.exists(video_path):
+                    # 尝试用 pattern 拼接（如果之前未构建）
+                    if video_path is None:
+                        video_path = os.path.join(args.video_dir, args.pattern.format(id=db_id))
+                    if not os.path.exists(video_path):
+                        failed_db.add(db_id)
+                        processed_db.add(db_id)
+                        pbar.update(1)
+                        continue
 
                 frames = extract_frames_from_video(video_path, db_id, args.frames_dir, args.max_frames)
                 if frames is None or frames.shape[0] < 4:
+                    failed_db.add(db_id)
                     processed_db.add(db_id)
                     pbar.update(1)
                     continue
@@ -284,6 +402,7 @@ def main():
                 db_features = extract_features_from_frames(model, frames, db_id, args.features_dir,
                                                            device, args.batch_sz)
                 if db_features is None:
+                    failed_db.add(db_id)
                     processed_db.add(db_id)
                     pbar.update(1)
                     continue
@@ -304,7 +423,6 @@ def main():
 
                 processed_db.add(db_id)
 
-                # [修改点] 每处理 50 个视频保存一次检查点，避免频繁 I/O
                 if len(processed_db) % 50 == 0:
                     checkpoint = {
                         'similarities': similarities,
@@ -312,7 +430,6 @@ def main():
                     }
                     with open(checkpoint_file, 'w') as f:
                         json.dump(checkpoint, f)
-                    # [修改点] 在进度条后添加简短信息，不单独占行
                     pbar.set_postfix(saved=f"{len(processed_db)}/{len(database_ids)}")
 
                 del frames, db_features
@@ -322,19 +439,21 @@ def main():
 
             except Exception as e:
                 print(f"\n> 处理 {db_id} 失败: {str(e)[:100]}")
+                failed_db.add(db_id)
                 processed_db.add(db_id)
             finally:
                 pbar.update(1)
 
         pbar.close()
 
-        # 最终保存一次
         checkpoint = {
             'similarities': similarities,
             'processed_db': list(processed_db)
         }
         with open(checkpoint_file, 'w') as f:
             json.dump(checkpoint, f)
+
+        print(f"> 数据库视频完成: 成功 {len(processed_db) - len(failed_db)}/{len(database_ids)}, 失败 {len(failed_db)}")
 
     # ---------- 第三阶段：保存结果 ----------
     print("\n" + "=" * 60)
@@ -363,6 +482,14 @@ def main():
     print("第四阶段：评估")
     print("=" * 60)
     try:
+        # 注意：评估需要 dataset 对象，若未加载则需重新加载
+        if 'dataset' not in locals():
+            if 'FIVR' in args.dataset:
+                from datasets import FIVR
+                version = args.dataset.split('-')[1].lower() if '-' in args.dataset else '5k'
+                dataset = FIVR(version=version)
+            else:
+                raise ValueError(f"未知数据集: {args.dataset}")
         eval_results = dataset.evaluate(similarities)
         eval_file = os.path.join(args.output_dir, "evaluation_results.json")
         with open(eval_file, 'w') as f:
