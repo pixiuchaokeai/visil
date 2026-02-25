@@ -9,7 +9,6 @@ import time
 import traceback
 import subprocess
 import tempfile
-import shutil
 import cv2
 from PIL import Image  # [修改点] 用于读取 JPG
 
@@ -18,7 +17,7 @@ from torch.utils.data import DataLoader
 from datasets.generators import VideoGenerator
 
 
-# [修改点] ffprobe 检查与帧类型获取函数
+# ffprobe 检查与帧类型获取函数
 def check_ffprobe(ffprobe_path='ffprobe'):
     """检查 ffprobe 是否可用"""
     try:
@@ -29,6 +28,7 @@ def check_ffprobe(ffprobe_path='ffprobe'):
         return False
 
 
+# [修改点] 在 ffprobe 命令中添加 -loglevel error 以抑制警告
 def get_frame_types(video_path, ffprobe_path='ffprobe'):
     """
     使用 ffprobe 获取视频每一帧的类型（I/P/B）
@@ -40,7 +40,7 @@ def get_frame_types(video_path, ffprobe_path='ffprobe'):
 
         cmd = [
             ffprobe_path,
-            '-v', 'error',
+            '-v', 'error',               # [修改点] 只显示错误，不显示警告
             '-select_streams', 'v:0',
             '-show_frames',
             '-show_entries', 'frame=pict_type',
@@ -50,6 +50,8 @@ def get_frame_types(video_path, ffprobe_path='ffprobe'):
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
+            # [修改点] 不打印详细 stderr，只输出简单提示
+            print(f"> ffprobe 分析失败 (返回码 {result.returncode})")
             return []
 
         with open(tmp_path, 'r') as f:
@@ -68,19 +70,20 @@ def get_frame_types(video_path, ffprobe_path='ffprobe'):
                 frame_types.append('?')
         return frame_types
     except Exception as e:
-        print(f"> ffprobe 分析失败: {e}")
+        print(f"> ffprobe 分析异常: {e}")
         if 'tmp_path' in locals() and os.path.exists(tmp_path):
             os.unlink(tmp_path)
         return []
 
 
-# [修改点] 视频帧读取器（流式，支持随机访问）
+# [修改点] 视频帧读取器，增加 fps 属性
 class VideoFrameReader:
     """封装 Decord 和 OpenCV 的视频帧读取器，支持随机访问和批量读取"""
     def __init__(self, video_path):
         self.video_path = video_path
         self.reader = None
         self.total_frames = 0
+        self.fps = 30.0  # [修改点] 默认帧率
         self.use_decord = False
         self._init_reader()
 
@@ -91,8 +94,13 @@ class VideoFrameReader:
             from decord import VideoReader, cpu
             self.reader = VideoReader(self.video_path, ctx=cpu(0))
             self.total_frames = len(self.reader)
+            # [修改点] 获取 Decord 的帧率
+            try:
+                self.fps = self.reader.get_avg_fps()
+            except:
+                self.fps = 30.0
             self.use_decord = True
-            print(f"信息: Decord成功打开视频 {os.path.basename(self.video_path)} ({self.total_frames} 帧)")
+            print(f"信息: Decord成功打开视频 {os.path.basename(self.video_path)} ({self.total_frames} 帧, {self.fps:.2f} fps)")
             return
         except Exception as e:
             print(f"Decord打开失败: {e}")
@@ -103,8 +111,12 @@ class VideoFrameReader:
             if not self.reader.isOpened():
                 raise ValueError("无法打开视频")
             self.total_frames = int(self.reader.get(cv2.CAP_PROP_FRAME_COUNT))
+            # [修改点] 获取 OpenCV 的帧率
+            self.fps = self.reader.get(cv2.CAP_PROP_FPS)
+            if self.fps <= 0 or self.fps > 144:
+                self.fps = 30.0
             self.use_decord = False
-            print(f"信息: OpenCV成功打开视频 {os.path.basename(self.video_path)} ({self.total_frames} 帧)")
+            print(f"信息: OpenCV成功打开视频 {os.path.basename(self.video_path)} ({self.total_frames} 帧, {self.fps:.2f} fps)")
             return
         except Exception as e:
             print(f"OpenCV打开失败: {e}")
@@ -142,26 +154,7 @@ class VideoFrameReader:
             self.reader.release()
 
 
-# [修改点] 保存关键帧为 JPG 文件（路径调整为 frames_dir/视频名/jpg/）
-def save_frames_as_jpg(frames, video_id, base_dir, indices):
-    """
-    将选定的帧保存为 JPG 图像
-    frames: numpy 数组 [N, H, W, 3] (RGB, uint8)
-    base_dir: 视频专属目录，例如 frames_dir/视频名
-    indices: 选定的帧索引列表（对应原始帧号）
-    """
-    jpg_dir = os.path.join(base_dir, 'jpg')
-    os.makedirs(jpg_dir, exist_ok=True)
-    saved = 0
-    for i, frame_idx in enumerate(indices):
-        frame = frames[i]
-        jpg_path = os.path.join(jpg_dir, f"frame_{frame_idx:06d}.jpg")
-        cv2.imwrite(jpg_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 90])
-        saved += 1
-    print(f"    已保存 {saved} 个 JPG 关键帧到 {jpg_dir}")
-
-
-# [修改点] 从 JPG 缓存加载帧张量
+# [修改点] 从 JPG 缓存加载帧张量，增加异常保护
 def load_frames_from_jpg(video_subdir, indices):
     """
     从 jpg 目录读取指定索引的帧，返回 torch.Tensor [N, C, H, W] (值范围 0-255)
@@ -170,12 +163,16 @@ def load_frames_from_jpg(video_subdir, indices):
     frames = []
     for idx in indices:
         jpg_path = os.path.join(jpg_dir, f"frame_{idx:06d}.jpg")
-        if not os.path.exists(jpg_path):
-            print(f"> 警告: JPG 文件缺失 {jpg_path}")
+        try:
+            if not os.path.exists(jpg_path):
+                print(f"> 警告: JPG 文件缺失 {jpg_path}")
+                return None
+            img = Image.open(jpg_path).convert('RGB')
+            img_np = np.array(img)  # [H, W, 3]
+            frames.append(img_np)
+        except Exception as e:
+            print(f"> 警告: 读取 JPG 失败 {jpg_path}: {e}")
             return None
-        img = Image.open(jpg_path).convert('RGB')
-        img_np = np.array(img)  # [H, W, 3]
-        frames.append(img_np)
     if not frames:
         return None
     frames_np = np.stack(frames, axis=0)  # [N, H, W, 3]
@@ -187,64 +184,45 @@ def load_frames_from_jpg(video_subdir, indices):
     return frames_tensor
 
 
+# [修改点] 只使用 JPG 缓存，并根据新规则处理帧数限制，修改 2s 方法为基于时间
 def extract_frames_from_video(video_path: str, video_id: str, frames_dir: str,
-                              method: str, max_frames: int = 75,
-                              lm_threshold: float = 0.6, ffprobe_path='ffprobe',
-                              save_jpg: bool = True,
-                              cache_format: str = 'npy'):  # [修改点] 新增 cache_format 参数
+                              method: str, max_frames: int = 0,      # [修改点] 默认 0 表示无限制
+                              lm_threshold: float = 0.6, ffprobe_path='ffprobe'):
     """
-    从视频文件提取帧并保存为指定格式的缓存，支持多种帧提取方法。
+    从视频文件提取帧并保存为 JPG 缓存，支持多种帧提取方法。
     方法：
         default       : 每秒1帧（均匀采样）
-        2s            : 每2秒1帧（均匀采样）
+        2s            : 每2秒1帧（基于时间，需要 FPS）
         local_maxima  : 基于帧间差异的局部最大值关键帧（需要 lm_threshold）
-        iframe        : 基于 I 帧抽取（需 ffprobe）
+        iframe        : 基于 I 帧抽取（需 ffprobe）—— 超过限制时全部保留
+        i_p_mixed     : I 帧 + 重要 P 帧混合抽取（需 ffprobe）—— 超过限制时保留所有 I 帧，仅对 P 帧采样
     返回: [T, C, H, W] 的 torch.Tensor 或 None
     """
     video_subdir = os.path.join(frames_dir, video_id)
     os.makedirs(video_subdir, exist_ok=True)
 
-    # [修改点] 根据缓存格式检查是否存在有效缓存
     indices_file = os.path.join(video_subdir, 'indices.json')
-    if cache_format == 'npy':
-        frames_file = os.path.join(video_subdir, f"{video_id}.npy")
-        if os.path.exists(frames_file):
-            try:
-                frames_np = np.load(frames_file)
-                frames = torch.from_numpy(frames_np).float()
-                if frames.dim() == 4 and frames.shape[1] == 3 and frames.shape[2] == frames.shape[3] == 224:
-                    print(f"> 使用 npy 缓存: {frames_file}")
+    # 检查 JPG 缓存是否存在且完整
+    if os.path.exists(indices_file):
+        try:
+            with open(indices_file, 'r') as f:
+                indices = json.load(f)
+            indices = [int(idx) for idx in indices]
+            # 检查所有 jpg 文件是否存在
+            jpg_dir = os.path.join(video_subdir, 'jpg')
+            all_exist = True
+            for idx in indices:
+                jpg_path = os.path.join(jpg_dir, f"frame_{idx:06d}.jpg")
+                if not os.path.exists(jpg_path):
+                    all_exist = False
+                    break
+            if all_exist:
+                print(f"> 使用 jpg 缓存: {jpg_dir}")
+                frames = load_frames_from_jpg(video_subdir, indices)
+                if frames is not None:
                     return frames
-                else:
-                    print(f"> npy 缓存维度异常，重新提取")
-                    os.remove(frames_file)
-            except Exception:
-                try:
-                    os.remove(frames_file)
-                except:
-                    pass
-    else:  # cache_format == 'jpg'
-        if os.path.exists(indices_file):
-            try:
-                with open(indices_file, 'r') as f:
-                    indices = json.load(f)
-                # [修改点] 确保索引为 int 类型（JSON 默认 int，但可能被读为 float？保险转换）
-                indices = [int(idx) for idx in indices]
-                # 检查所有 jpg 文件是否存在
-                jpg_dir = os.path.join(video_subdir, 'jpg')
-                all_exist = True
-                for idx in indices:
-                    jpg_path = os.path.join(jpg_dir, f"frame_{idx:06d}.jpg")
-                    if not os.path.exists(jpg_path):
-                        all_exist = False
-                        break
-                if all_exist:
-                    print(f"> 使用 jpg 缓存: {jpg_dir}")
-                    frames = load_frames_from_jpg(video_subdir, indices)
-                    if frames is not None:
-                        return frames
-            except Exception as e:
-                print(f"> jpg 缓存加载失败: {e}，重新提取")
+        except Exception as e:
+            print(f"> jpg 缓存加载失败: {e}，重新提取")
 
     if not os.path.exists(video_path):
         print(f"> 视频文件不存在: {video_path}")
@@ -267,15 +245,27 @@ def extract_frames_from_video(video_path: str, video_id: str, frames_dir: str,
 
     # 根据方法确定关键帧索引
     if method == 'default':
-        step = max(1, total_frames // max_frames)
-        selected_indices = list(range(0, total_frames, step))[:max_frames]
+        step = max(1, total_frames // max_frames) if max_frames > 0 else 1
+        selected_indices = list(range(0, total_frames, step))
+        if max_frames > 0:
+            selected_indices = selected_indices[:max_frames]
 
     elif method == '2s':
-        target_count = min(max_frames, total_frames // 2)
-        if target_count < 1:
-            target_count = 1
-        step = max(1, total_frames // target_count)
-        selected_indices = list(range(0, total_frames, step))[:target_count]
+        # [修改点] 基于时间间隔每2秒一帧
+        fps = reader.fps
+        interval_frames = int(round(fps * 2))  # 每2秒对应的帧数
+        if interval_frames < 1:
+            interval_frames = 1
+        print(f"  帧率 {fps:.2f}，每2秒约 {interval_frames} 帧")
+        if max_frames > 0:
+            # 如果有限制，先按时间采样，再截取
+            selected_indices = list(range(0, total_frames, interval_frames))
+            if len(selected_indices) > max_frames:
+                step = len(selected_indices) / max_frames
+                selected_indices = [selected_indices[int(i * step)] for i in range(max_frames)]
+        else:
+            selected_indices = list(range(0, total_frames, interval_frames))
+        print(f"  选定 {len(selected_indices)} 个关键帧（每2秒一帧）")
 
     elif method == 'local_maxima':
         print(f"  计算帧间差异...")
@@ -307,7 +297,7 @@ def extract_frames_from_video(video_path: str, video_id: str, frames_dir: str,
             candidates = [0] + (sorted_idx+1).tolist()
 
         candidates = sorted(set(candidates))
-        if len(candidates) > max_frames:
+        if max_frames > 0 and len(candidates) > max_frames:
             step = len(candidates) // max_frames
             candidates = candidates[::step][:max_frames]
         selected_indices = [idx for idx in candidates if 0 <= idx < total_frames]
@@ -319,19 +309,70 @@ def extract_frames_from_video(video_path: str, video_id: str, frames_dir: str,
         frame_types = get_frame_types(video_path, ffprobe_path)
         if not frame_types:
             print(f"> 无法获取帧类型，回退到 default 方法")
-            step = max(1, total_frames // max_frames)
-            selected_indices = list(range(0, total_frames, step))[:max_frames]
+            step = max(1, total_frames // max_frames) if max_frames > 0 else 1
+            selected_indices = list(range(0, total_frames, step))
+            if max_frames > 0:
+                selected_indices = selected_indices[:max_frames]
         else:
             i_frames = [i for i, ft in enumerate(frame_types) if ft == 'I']
             if not i_frames:
                 print(f"> 视频无 I 帧，回退到 default")
-                step = max(1, total_frames // max_frames)
-                selected_indices = list(range(0, total_frames, step))[:max_frames]
+                step = max(1, total_frames // max_frames) if max_frames > 0 else 1
+                selected_indices = list(range(0, total_frames, step))
+                if max_frames > 0:
+                    selected_indices = selected_indices[:max_frames]
             else:
-                if len(i_frames) > max_frames:
-                    step = len(i_frames) // max_frames
-                    i_frames = i_frames[::step][:max_frames]
+                # [修改点] 纯 I 帧方法：即使超过 max_frames 也全部保留
                 selected_indices = i_frames
+                print(f"  抽取 {len(selected_indices)} 个 I 帧（不限制数量）")
+
+    elif method == 'i_p_mixed':
+        if not check_ffprobe(ffprobe_path):
+            raise RuntimeError("ffprobe 不可用，无法使用 i_p_mixed 方法")
+        frame_types = get_frame_types(video_path, ffprobe_path)
+        if not frame_types:
+            print(f"> 无法获取帧类型，回退到 default 方法")
+            step = max(1, total_frames // max_frames) if max_frames > 0 else 1
+            selected_indices = list(range(0, total_frames, step))
+            if max_frames > 0:
+                selected_indices = selected_indices[:max_frames]
+        else:
+            i_frames = [i for i, ft in enumerate(frame_types) if ft == 'I']
+            p_frames = []
+            in_gop = False
+            gop_start = -1
+            for i, ft in enumerate(frame_types):
+                if ft == 'I':
+                    in_gop = True
+                    gop_start = i
+                elif ft == 'P' and in_gop:
+                    if i - gop_start <= 5:
+                        p_frames.append(i)
+                    in_gop = False
+            all_frames = sorted(set(i_frames + p_frames))
+            print(f"  原始: I帧={len(i_frames)}, 重要P帧={len(p_frames)}, 总计={len(all_frames)}")
+            # [修改点] 超过限制时保留所有I帧，只对P帧采样
+            if max_frames > 0 and len(all_frames) > max_frames:
+                num_i = len(i_frames)
+                if num_i >= max_frames:
+                    selected_indices = i_frames
+                    print(f"  警告：I帧数量({num_i})已超过限制({max_frames})，全部保留I帧，不添加P帧")
+                else:
+                    max_p = max_frames - num_i
+                    if len(p_frames) <= max_p:
+                        selected_indices = all_frames
+                    else:
+                        step = len(p_frames) / max_p
+                        sampled_p = []
+                        for k in range(max_p):
+                            idx = int(k * step)
+                            if idx < len(p_frames):
+                                sampled_p.append(p_frames[idx])
+                        selected_indices = sorted(set(i_frames + sampled_p))
+                        print(f"  采样后: I帧保留 {num_i} 个, P帧采样 {len(sampled_p)}/{len(p_frames)} 个, 总计 {len(selected_indices)}")
+            else:
+                selected_indices = all_frames
+
     else:
         raise ValueError(f"未知的帧提取方法: {method}")
 
@@ -348,37 +389,28 @@ def extract_frames_from_video(video_path: str, video_id: str, frames_dir: str,
     if frames_tensor.shape[2] != 224 or frames_tensor.shape[3] != 224:
         frames_tensor = F.interpolate(frames_tensor, size=(224, 224), mode='bilinear', align_corners=False)
 
-    # [修改点] 根据缓存格式保存
-    if cache_format == 'npy':
-        frames_file = os.path.join(video_subdir, f"{video_id}.npy")
-        np.save(frames_file, frames_tensor.cpu().numpy())
-        print(f"> 保存 npy 缓存: {frames_file}")
-    else:  # jpg
-        # 保存 JPG（即使 cache_format 是 jpg，也调用 save_jpg 保存，但 save_jpg 可能为 False，这里强制保存）
-        jpg_dir = os.path.join(video_subdir, 'jpg')
-        os.makedirs(jpg_dir, exist_ok=True)
-        for i, idx in enumerate(selected_indices):
-            frame = frames_np[i]
-            jpg_path = os.path.join(jpg_dir, f"frame_{idx:06d}.jpg")
-            cv2.imwrite(jpg_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 90])
-        print(f"> 保存 jpg 缓存: {jpg_dir}")
+    # [修改点] 只保存 JPG 缓存，不再保存 npy
+    jpg_dir = os.path.join(video_subdir, 'jpg')
+    os.makedirs(jpg_dir, exist_ok=True)
+    for i, idx in enumerate(selected_indices):
+        frame = frames_np[i]
+        jpg_path = os.path.join(jpg_dir, f"frame_{idx:06d}.jpg")
+        cv2.imwrite(jpg_path, cv2.cvtColor(frame, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 90])
+    print(f"> 保存 jpg 缓存: {jpg_dir} ({len(selected_indices)} 帧)")
 
-    # [修改点] 保存索引列表，并确保索引为 Python int 类型
-    # 将 selected_indices 中的 numpy 类型转换为 Python int
+    # 保存索引列表，并确保索引为 Python int 类型
     selected_indices_py = [int(idx) for idx in selected_indices]
     with open(indices_file, 'w') as f:
         json.dump(selected_indices_py, f)
 
-    # 如果 save_jpg 为 True 且缓存格式不是 jpg，额外保存一份 JPG 用于可视化
-    if save_jpg and cache_format != 'jpg':
-        save_frames_as_jpg(frames_np, video_id, video_subdir, selected_indices_py)
-
     return frames_tensor
 
 
+# [修改点] 特征提取函数，增加维度验证和路径分离（通过传入的 features_dir 已区分）
 def extract_features_from_frames(model, frames: torch.Tensor, video_id: str, features_dir: str,
-                                 device: torch.device, batch_size: int = 4):
-    """从帧数据提取特征并保存为npy，优先使用缓存，并验证特征维度（第二维必须为9）"""
+                                 device: torch.device, batch_size: int = 4,
+                                 expected_dims: int = 3840):  # [修改点] 新增 expected_dims 参数
+    """从帧数据提取特征并保存为npy，优先使用缓存，并验证特征维度"""
     video_subdir = os.path.join(features_dir, video_id)
     os.makedirs(video_subdir, exist_ok=True)
     features_file = os.path.join(video_subdir, f"{video_id}.npy")
@@ -387,12 +419,14 @@ def extract_features_from_frames(model, frames: torch.Tensor, video_id: str, fea
         try:
             features_np = np.load(features_file)
             features = torch.from_numpy(features_np).float()
-            if features.dim() == 3 and features.shape[1] == 9:
+            # [修改点] 验证维度是否与当前模型匹配
+            if features.dim() == 3 and features.shape[1] == 9 and features.shape[2] == expected_dims:
                 return features
             else:
-                print(f"> 特征文件 {video_id}.npy 维度异常 {features.shape}（期望第二维为9），重新提取")
+                print(f"> 特征文件 {video_id}.npy 维度异常 {features.shape}（期望 [*, 9, {expected_dims}]），重新提取")
                 os.remove(features_file)
-        except Exception:
+        except Exception as e:
+            print(f"> 特征文件 {video_id}.npy 加载失败: {e}，重新提取")
             try:
                 os.remove(features_file)
             except:
@@ -434,6 +468,11 @@ def extract_features_from_frames(model, frames: torch.Tensor, video_id: str, fea
             print(f"> 提取的特征 {video_id} 维度异常: {features.shape}，期望第二维为9")
             return None
 
+        # [修改点] 再次验证维度
+        if features.shape[2] != expected_dims:
+            print(f"> 提取的特征 {video_id} 维度异常: {features.shape}，期望最后一维为 {expected_dims}")
+            return None
+
         np.save(features_file, features.cpu().numpy())
         return features
 
@@ -443,15 +482,16 @@ def extract_features_from_frames(model, frames: torch.Tensor, video_id: str, fea
         return None
 
 
+# [修改点] 处理查询视频，传递 expected_dims
 def process_query_videos(query_ids, id_to_path, model, device,
                          frames_dir, features_dir, frame_method, lm_threshold,
-                         batch_size=4, max_frames=75, ffprobe_path='ffprobe',
-                         save_jpg=True, cache_format='npy'):  # [修改点] 传递 cache_format
+                         batch_size=4, max_frames=0, ffprobe_path='ffprobe',
+                         expected_dims=3840):   # [修改点] 新增 expected_dims 参数
     """处理查询视频，返回特征字典和失败列表"""
     query_features = {}
     failed_queries = []
 
-    print(f"> 处理查询视频 ({len(query_ids)}个) 方法: {frame_method}, 缓存格式: {cache_format}")
+    print(f"> 处理查询视频 ({len(query_ids)}个) 方法: {frame_method}, 最大帧数: {max_frames if max_frames>0 else '无限制'}")
     for idx, query_id in enumerate(tqdm(query_ids, desc="查询视频")):
         try:
             if query_id in id_to_path:
@@ -467,13 +507,13 @@ def process_query_videos(query_ids, id_to_path, model, device,
 
             frames = extract_frames_from_video(video_path, query_id, frames_dir,
                                                frame_method, max_frames, lm_threshold,
-                                               ffprobe_path, save_jpg, cache_format)
+                                               ffprobe_path)
             if frames is None or frames.shape[0] < 4:
                 failed_queries.append(query_id)
                 continue
 
             features = extract_features_from_frames(model, frames, query_id, features_dir,
-                                                    device, batch_size)
+                                                    device, batch_size, expected_dims)
             if features is None:
                 failed_queries.append(query_id)
                 continue
@@ -496,7 +536,7 @@ def process_query_videos(query_ids, id_to_path, model, device,
 
 
 def main():
-    parser = argparse.ArgumentParser(description='增强版视频相似度评估')
+    parser = argparse.ArgumentParser(description='增强版视频相似度评估（仅使用 JPG 帧缓存）')
     parser.add_argument('--dataset', type=str, default="FIVR-5K",
                         choices=["FIVR-200K", "FIVR-5K", "CC_WEB_VIDEO", "SVD", "EVVE"],
                         help='评估数据集名称')
@@ -508,23 +548,26 @@ def main():
                         help='查询视频列表文件（每行：id 路径）')
     parser.add_argument('--database_file', type=str, default="datasets/fivr-5k-database-filtered.txt",
                         help='数据库视频列表文件（每行：id 路径）')
-    parser.add_argument('--max_frames', type=int, default=75,
-                        help='每个视频最大帧数，默认75')
+    # [修改点] max_frames 默认 0 表示无限制
+    parser.add_argument('--max_frames', type=int, default=0,
+                        help='每个视频最大帧数，设为 0 表示不限制')
     parser.add_argument('--batch_sz', type=int, default=4,
                         help='特征提取批次大小')
     parser.add_argument('--gpu_id', type=int, default=0,
                         help='GPU ID')
-    parser.add_argument('--cpu_only', action='store_true',
-
-    help='强制使用CPU')
-    parser.add_argument('--frame_method', type=str, default='local_maxima',
-                        choices=['default', '2s', 'local_maxima', 'iframe'],
-                        help='帧提取方法: default(每秒1帧), 2s(每2秒1帧), local_maxima(局部极大值), iframe(I帧)')
+    # [修改点] --cpu_only 默认不启用，即自动选择GPU（如果可用），否则CPU
+    parser.add_argument('--cpu_only', action='store_true', default=False,
+                        help='强制使用CPU（默认不启用，即自动选择GPU如果可用）')
+    # [修改点] 默认方法改为 i_p_mixed
+    parser.add_argument('--frame_method', type=str, default='default',
+                        choices=['default', '2s', 'local_maxima', 'iframe', 'i_p_mixed'],
+                        help='帧提取方法: default(每秒1帧), 2s(每2秒1帧), local_maxima(局部极大值), iframe(I帧), i_p_mixed(I帧+重要P帧)')
     parser.add_argument('--lm_threshold', type=float, default=0.6,
                         help='local_maxima 方法的差异阈值（默认0.6）')
-    parser.add_argument('--similarity_function', type=str, default='symmetric_chamfer',
+    # [修改点] 默认相似度函数改为 chamfer (visil_v)
+    parser.add_argument('--similarity_function', type=str, default='chamfer',
                         choices=["chamfer", "symmetric_chamfer"],
-                        help='相似度函数')
+                        help='相似度函数：chamfer(visil_v) 或 symmetric_chamfer(visil_sym)')
     parser.add_argument('--frames_dir', type=str, default='output/frames1',
                         help='基础帧文件目录，实际会根据方法附加后缀')
     parser.add_argument('--features_dir', type=str, default='output/features1',
@@ -533,25 +576,27 @@ def main():
                         help='输出目录')
     parser.add_argument('--ffprobe_path', type=str, default='ffprobe',
                         help='ffprobe 可执行文件路径（用于 iframe 方法）')
-    parser.add_argument('--save_jpg', action='store_true', default=True,
-                        help='是否额外保存 JPG 图像用于可视化（即使缓存格式为 npy）')
-    # [修改点] 新增缓存格式参数
-    parser.add_argument('--cache_format', type=str, default='jpg',
-                        choices=['npy', 'jpg'],
-                        help='帧缓存格式: npy (快速加载) 或 jpg (节省空间，但加载较慢)')
     args = parser.parse_args()
 
     # 根据帧提取方法和阈值确定实际目录
     method_suffix = args.frame_method
     if args.frame_method == 'local_maxima':
         method_suffix = f'local_maxima_{args.lm_threshold}'
+
+    # [修改点] 根据相似度函数确定模型类型，并生成对应的特征目录后缀
+    is_symmetric = 'symmetric' in args.similarity_function
+    model_suffix = '_sym' if is_symmetric else '_v'   # 用于路径区分
+    expected_dims = 512 if is_symmetric else 3840     # 用于维度验证
+
     actual_frames_dir = os.path.join(args.frames_dir, method_suffix)
-    actual_features_dir = os.path.join(args.features_dir, method_suffix)
+    # [修改点] 特征目录加入模型后缀，实现路径分离
+    actual_features_dir = os.path.join(args.features_dir, method_suffix + model_suffix)
 
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(actual_frames_dir, exist_ok=True)
     os.makedirs(actual_features_dir, exist_ok=True)
 
+    # [修改点] 设备选择：--cpu_only 默认为 False，即自动选择 GPU（若可用）
     if args.cpu_only or not torch.cuda.is_available():
         device = torch.device('cpu')
         args.batch_sz = min(args.batch_sz, 4)
@@ -566,7 +611,7 @@ def main():
     try:
         model = ViSiL(
             pretrained=True,
-            symmetric=('symmetric' in args.similarity_function)
+            symmetric=is_symmetric
         ).to(device)
         model.eval()
         print("> 模型加载成功")
@@ -646,13 +691,14 @@ def main():
 
     # ========== 第一阶段：帧提取 ==========
     print("\n" + "=" * 60)
-    print(f"第一阶段：帧提取 (方法: {args.frame_method}, 缓存格式: {args.cache_format})")
+    print(f"第一阶段：帧提取 (方法: {args.frame_method}, 最大帧数: {args.max_frames if args.max_frames>0 else '无限制'})")
     print("=" * 60)
     frame_start = time.time()
     query_features, q_failed = process_query_videos(
         query_ids, id_to_path, model, device,
         actual_frames_dir, actual_features_dir, args.frame_method, args.lm_threshold,
-        args.batch_sz, args.max_frames, args.ffprobe_path, args.save_jpg, args.cache_format
+        args.batch_sz, args.max_frames, args.ffprobe_path,
+        expected_dims  # [修改点] 传递 expected_dims
     )
     frame_time = time.time() - frame_start
     stage_times['frame_extraction'] = frame_time
@@ -665,7 +711,7 @@ def main():
     print("第二阶段：数据库视频特征提取")
     print("=" * 60)
     feature_start = time.time()
-    checkpoint_file = os.path.join(args.output_dir, f"checkpoint_{method_suffix}.json")
+    checkpoint_file = os.path.join(args.output_dir, f"checkpoint_{method_suffix}{model_suffix}.json")  # [修改点] 检查点也区分模型
     similarities = {}
     processed_db = set()
     failed_db = set()
@@ -697,8 +743,7 @@ def main():
 
                 frames = extract_frames_from_video(video_path, db_id, actual_frames_dir,
                                                    args.frame_method, args.max_frames,
-                                                   args.lm_threshold, args.ffprobe_path,
-                                                   args.save_jpg, args.cache_format)
+                                                   args.lm_threshold, args.ffprobe_path)
                 if frames is None or frames.shape[0] < 4:
                     failed_db.add(db_id)
                     processed_db.add(db_id)
@@ -706,7 +751,7 @@ def main():
                     continue
 
                 db_features = extract_features_from_frames(model, frames, db_id, actual_features_dir,
-                                                           device, args.batch_sz)
+                                                           device, args.batch_sz, expected_dims)  # [修改点] 传递 expected_dims
                 if db_features is None:
                     failed_db.add(db_id)
                     processed_db.add(db_id)
@@ -773,6 +818,7 @@ def main():
             try:
                 db_feat_np = np.load(db_feat_file)
                 db_feat = torch.from_numpy(db_feat_np).float().to(device)
+                # [修改点] 维度验证已在特征提取时完成，此处仅用于计算
                 with torch.no_grad():
                     if q_feat_device.dim() == 2:
                         q_input = q_feat_device.unsqueeze(0)
@@ -801,12 +847,12 @@ def main():
     print("\n" + "=" * 60)
     print("保存结果")
     print("=" * 60)
-    result_file = os.path.join(args.output_dir, f"similarities_{method_suffix}.json")
+    result_file = os.path.join(args.output_dir, f"similarities_{method_suffix}{model_suffix}.json")
     with open(result_file, 'w') as f:
         json.dump(similarities, f, separators=(',', ':'))
     print(f"> 相似度保存: {result_file}")
 
-    sorted_file = os.path.join(args.output_dir, f"sorted_results_{method_suffix}.json")
+    sorted_file = os.path.join(args.output_dir, f"sorted_results_{method_suffix}{model_suffix}.json")
     sorted_results = {}
     for qid, qsims in similarities.items():
         sorted_items = sorted(qsims.items(), key=lambda x: x[1], reverse=True)[:100]
@@ -833,7 +879,7 @@ def main():
             else:
                 raise ValueError(f"未知数据集: {args.dataset}")
         eval_results = dataset.evaluate(similarities)
-        eval_file = os.path.join(args.output_dir, f"evaluation_results_{method_suffix}.json")
+        eval_file = os.path.join(args.output_dir, f"evaluation_results_{method_suffix}{model_suffix}.json")
         with open(eval_file, 'w') as f:
             json.dump(eval_results, f, indent=2)
         print(f"> 评估结果保存: {eval_file}")
@@ -849,18 +895,18 @@ def main():
     eval_time = time.time() - eval_start
 
     # ========== 生成总结文件 ==========
-    summary_file = os.path.join(args.output_dir, f"summary_{method_suffix}.txt")
+    summary_file = os.path.join(args.output_dir, f"summary_{method_suffix}{model_suffix}.txt")
     with open(summary_file, 'w') as f:
         f.write("=" * 60 + "\n")
         f.write("ViSiL 评估总结\n")
         f.write("=" * 60 + "\n\n")
         f.write(f"数据集: {args.dataset}\n")
-        f.write(f"模型类型: {'visil_sym' if 'symmetric' in args.similarity_function else 'visil_v'}\n")
+        # [修改点] 记录文件中区分 visil_v 和 visil_sym
+        f.write(f"模型类型: {'visil_sym' if is_symmetric else 'visil_v'}\n")
         f.write(f"帧提取方法: {args.frame_method}\n")
         if args.frame_method == 'local_maxima':
             f.write(f"  lm_threshold: {args.lm_threshold}\n")
-        f.write(f"缓存格式: {args.cache_format}\n")
-        f.write(f"最大帧数: {args.max_frames}\n")
+        f.write(f"最大帧数: {args.max_frames if args.max_frames>0 else '无限制'}\n")
         f.write(f"设备: {'GPU' if not args.cpu_only and torch.cuda.is_available() else 'CPU'}\n\n")
         f.write("各阶段耗时:\n")
         f.write(f"  帧提取: {stage_times['frame_extraction']:.2f} 秒\n")
