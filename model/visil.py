@@ -55,65 +55,126 @@ class Feature_Extractor(nn.Module):
 
 
 class ViSiLHead(nn.Module):
+    """
+    ViSiL模型头部模块
+    负责：帧级相似度计算 -> 视频级相似度聚合 -> 注意力加权（可选）
+    """
 
     def __init__(self, dims=3840, attention=True, video_comperator=True, symmetric=False):
-        super(ViSiLHead, self).__init__()
-        if attention:
-            self.attention = Attention(dims, norm=True)
-        if video_comperator:
-            self.video_comperator = VideoComperator()
-        self.tensor_dot = TensorDot("biok,bjpk->biopj")
-        self.f2f_sim = ChamferSimilarity(axes=[4, 2], symmetric=symmetric)
+        super(ViSiLHead, self).__init__()  # 调用父类的初始化函数
+        if attention:  # 如果启用注意力机制
+            self.attention = Attention(dims, norm=True)  # 初始化注意力层（假设Attention类已定义）
+        if video_comperator:  # 如果启用视频比较器
+            self.video_comperator = VideoComperator()  # 初始化视频比较器（假设VideoComperator类已定义）
+        self.tensor_dot = TensorDot("biok,bjpk->biopj")  # 初始化张量点积层（自定义维度映射）
+        # 初始化帧到帧的Chamfer相似度计算层，指定轴参数[3,2]，对称模式由参数控制
+        self.f2f_sim = ChamferSimilarity(axes=[3, 2], symmetric=symmetric)
+        # 初始化视频到视频的Chamfer相似度计算层，指定轴参数[2,1]，对称模式由参数控制
         self.v2v_sim = ChamferSimilarity(axes=[2, 1], symmetric=symmetric)
-        self.htanh = nn.Hardtanh()
+        self.htanh = nn.Hardtanh()  # 初始化Hardtanh激活函数（限制输出范围在[-1,1]）
 
     def frame_to_frame_similarity(self, query, target):
-        sim = self.tensor_dot(query, target)
-        return self.f2f_sim(sim)
+        """
+        计算帧到帧的相似度矩阵
+        Args:
+            query: 查询视频特征 [batch, n_frames, n_proposals, dim]
+            target: 目标视频特征 [batch, m_frames, n_proposals, dim]
+        Returns:
+            帧级相似度矩阵
+        """
+        sim = self.tensor_dot(query, target)  # 计算两个张量的点积，得到原始相似度矩阵
+        return self.f2f_sim(sim)  # 应用Chamfer相似度计算，得到帧级相似度
 
     def visil_output(self, sim):
-        sim = sim.unsqueeze(1)
-        return self.video_comperator(sim).squeeze(1)
+        """
+        ViSiL输出处理：通过视频比较器聚合帧级相似度
+        Args:
+            sim: 帧级相似度矩阵
+        Returns:
+            聚合后的相似度特征
+        """
+        sim = sim.unsqueeze(1)  # 在维度1增加一个维度，适配video_comperator的输入格式
+        return self.video_comperator(sim).squeeze(1)  # 视频比较器处理后移除新增的维度
 
     def video_to_video_similarity(self, query, target):
+        """
+        计算视频到视频的最终相似度
+        Args:
+            query: 查询视频特征（注意力加权后）
+            target: 目标视频特征（注意力加权后）
+        Returns:
+            视频级相似度值
+        """
         # [修改点] 根据 apply_input_norm 标志决定是否对输入特征进行归一化检查
-        if hasattr(self, 'apply_input_norm') and self.apply_input_norm:
-            query_norm = torch.norm(query, dim=-1).mean()
-            target_norm = torch.norm(target, dim=-1).mean()
+        if hasattr(self, 'apply_input_norm') and self.apply_input_norm:  # 检查是否有归一化标志且为True
+            query_norm = torch.norm(query, dim=-1).mean()  # 计算查询特征的L2范数均值（最后一维是特征维度）
+            target_norm = torch.norm(target, dim=-1).mean()  # 计算目标特征的L2范数均值
+            # 如果任一特征的范数偏离1.0超过0.1，则进行L2归一化（保证特征在单位球面上）
             if abs(query_norm - 1.0) > 0.1 or abs(target_norm - 1.0) > 0.1:
-                query = F.normalize(query, p=2, dim=-1)
-                target = F.normalize(target, p=2, dim=-1)
+                query = F.normalize(query, p=2, dim=-1)  # 对查询特征做L2归一化（p=2表示L2范数）
+                target = F.normalize(target, p=2, dim=-1)  # 对目标特征做L2归一化
 
-        sim = self.frame_to_frame_similarity(query, target)
-        if hasattr(self, 'video_comperator'):
-            sim = self.visil_output(sim)
-            sim = self.htanh(sim)
-        return self.v2v_sim(sim)
+        sim = self.frame_to_frame_similarity(query, target)  # 计算帧级相似度矩阵
+        if hasattr(self, 'video_comperator'):  # 如果启用了视频比较器
+            sim = self.visil_output(sim)  # 通过视频比较器聚合相似度
+            sim = self.htanh(sim)  # 应用Hardtanh激活，限制输出范围
+
+        return self.v2v_sim(sim)  # 应用视频级Chamfer相似度计算，得到最终视频相似度
 
     def attention_weights(self, x):
-        x, weights = self.attention(x)
+        """
+        计算注意力权重并加权特征
+        Args:
+            x: 输入特征 [batch, frames, dim]
+        Returns:
+            加权后的特征 + 注意力权重
+        """
+        x, weights = self.attention(x)  # 计算注意力加权后的特征和权重
         # [修改点] 根据 apply_att_norm 标志决定是否在注意力加权后重新归一化
-        if hasattr(self, 'apply_att_norm') and self.apply_att_norm:
-            x = F.normalize(x, p=2, dim=-1)
-        return x, weights
+        if hasattr(self, 'apply_att_norm') and self.apply_att_norm:  # 检查是否有注意力后归一化标志且为True
+            x = F.normalize(x, p=2, dim=-1)  # 对注意力加权后的特征重新做L2归一化
+
+        return x, weights  # 返回加权特征和权重
 
     def prepare_tensor(self, x):
-        if hasattr(self, 'attention'):
-            x, _ = self.attention_weights(x)
-        return x
+        """
+        预处理输入张量（主要应用注意力机制）
+        Args:
+            x: 原始输入特征
+        Returns:
+            预处理后的特征（注意力加权后）
+        """
+        if hasattr(self, 'attention'):  # 如果启用了注意力机制
+            x, _ = self.attention_weights(x)  # 应用注意力加权，忽略权重输出
+        return x  # 返回预处理后的特征
 
     def apply_constrain(self):
-        if hasattr(self, 'att'):
-            self.att.apply_contraint()
+        """
+        应用约束条件（可选）
+        通常用于对注意力层等模块施加正则化约束
+        """
+        if hasattr(self, 'att'):  # 检查是否有att属性（注意力层）
+            self.att.apply_contraint()  # 调用注意力层的约束函数（假设已定义）
 
     def forward(self, query, target):
-        if query.ndim == 3:
-            query = query.unsqueeze(0)
-        if target.ndim == 3:
-            target = target.unsqueeze(0)
-        return self.video_to_video_similarity(query, target)
+        """
+        ViSiLHead主前向传播函数
+        Args:
+            query: 查询视频特征 [batch, frames, dim] 或 [frames, dim]
+            target: 目标视频特征 [batch, frames, dim] 或 [frames, dim]
+        Returns:
+            视频到视频的相似度值
+        """
+        if query.ndim == 3:  # 如果查询特征是3维（缺少batch维度）
+            query = query.unsqueeze(0)  # 在第0维增加batch维度（batch_size=1）
+        if target.ndim == 3:  # 如果目标特征是3维（缺少batch维度）
+            target = target.unsqueeze(0)  # 在第0维增加batch维度（batch_size=1）
 
+        # 预处理查询和目标特征（应用注意力机制）
+        query = self.prepare_tensor(query)  # 预处理查询特征
+        target = self.prepare_tensor(target)  # 预处理目标特征
 
+        return self.video_to_video_similarity(query, target)  # 计算并返回视频级相似度
 class ViSiL(nn.Module):
 
     def __init__(self, network='resnet50', pretrained=False, dims=3840,

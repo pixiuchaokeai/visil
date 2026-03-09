@@ -559,7 +559,7 @@ def main():
     parser.add_argument('--cpu_only', action='store_true', default=False,
                         help='强制使用CPU（默认不启用，即自动选择GPU如果可用）')
     # [修改点] 默认方法改为 i_p_mixed
-    parser.add_argument('--frame_method', type=str, default='default',
+    parser.add_argument('--frame_method', type=str, default='iframe',
                         choices=['default', '2s', 'local_maxima', 'iframe', 'i_p_mixed'],
                         help='帧提取方法: default(每秒1帧), 2s(每2秒1帧), local_maxima(局部极大值), iframe(I帧), i_p_mixed(I帧+重要P帧)')
     parser.add_argument('--lm_threshold', type=float, default=0.6,
