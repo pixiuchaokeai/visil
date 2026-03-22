@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import argparse
 import os
 import json
@@ -8,6 +9,7 @@ from tqdm import tqdm
 import time
 import traceback
 import warnings
+from PIL import Image  # [修改点] 用于保存JPG
 warnings.filterwarnings("ignore")
 
 # 设置 OpenCV ffmpeg 日志级别为 quiet
@@ -19,24 +21,25 @@ except:
     pass
 
 from model.visil import ViSiL
-from stage_utils import (
+from utils import (
     extract_keyframes,
     extract_features_from_frames,
+    extract_dense_frames_range_and_save,
+    VideoFrameReader,
+    save_interval_metadata,
+    load_interval_metadata,
+    merge_interval_pairs,
+    get_sorted_frames_from_dir
+)
+from model.similarities import (
     compute_keyframe_similarity_matrix,
     find_candidate_pairs,
-    extract_dense_frames_range_and_save,
-    compute_dense_similarity,
-    VideoFrameReader,
     save_similarity_matrix,
     load_similarity_matrix,
     load_features,
-    save_interval_metadata,
-    load_interval_metadata,
-    compute_and_save_heatmap,
-    merge_interval_pairs,
-    load_dense_frames_from_dir,
-    get_sorted_frames_from_dir  # [修改点] 新增函数用于获取排序去重的帧列表
+    compute_dense_cosine_similarity
 )
+from visualization import compute_and_save_heatmap
 from datasets.generators import VideoGenerator
 
 
@@ -57,14 +60,14 @@ def main():
     parser.add_argument('--first_stage_method', type=str, default='iframe',
                         choices=['default', '2s', 'local_maxima', 'iframe', 'i_p_mixed'],
                         help='第一阶段关键帧提取方法')
-    parser.add_argument('--threshold', type=float, default=0.3,
+    parser.add_argument('--threshold', type=float, default=0.4,
                         help='相似度阈值，用于第二阶段筛选和第三阶段区间扩展')
     parser.add_argument('--max_keyframes', type=int, default=0,
                         help='第一阶段最大关键帧数（0表示不限制）')
     parser.add_argument('--lm_threshold', type=float, default=0.6,
                         help='local_maxima方法的差异阈值')
     # 密集采样参数
-    parser.add_argument('--dense_fps', type=float, default=2.0,
+    parser.add_argument('--dense_fps', type=float, default=1.0,
                         help='第三阶段密集采样帧率（每秒帧数）')
     # 模型和设备
     parser.add_argument('--batch_sz', type=int, default=4,
@@ -86,7 +89,7 @@ def main():
     parser.add_argument('--ffprobe_path', type=str, default='ffprobe',
                         help='ffprobe 可执行文件路径')
     # 阶段控制参数
-    parser.add_argument('--stage', type=str, default='3',
+    parser.add_argument('--stage', type=str, default='4',
                         choices=['1', '2', '3', '4', 'all'],
                         help='要运行的阶段：1=关键帧提取与特征计算，2=相似度矩阵计算，3=密集帧提取，4=相似度计算+亮线，all=全部顺序执行')
     # 目录参数
@@ -100,7 +103,9 @@ def main():
                         help='第四阶段亮线热图保存目录（默认自动生成）')
     parser.add_argument('--dense_features_dir', type=str, default=None,
                         help='第四阶段密集帧特征缓存目录（默认自动生成）')
-    # [修改点] 第四阶段矩阵保存目录，改为 sim_matrices_chamfer_dense
+    # [修改点] 查询全局密集特征缓存目录，现在合并到 dense_features_dir 中
+    parser.add_argument('--dense_query_features_dir', type=str, default=None,
+                        help='查询视频全局密集帧特征缓存目录（默认自动生成）')
     parser.add_argument('--sim_matrices_dense_dir', type=str, default=None,
                         help='第四阶段密集帧相似度矩阵保存目录（默认自动生成）')
     # 兼容旧参数 --only_first_stage，将其映射为 stage=1
@@ -131,7 +136,6 @@ def main():
     os.makedirs(actual_frames_dir, exist_ok=True)
     os.makedirs(actual_features_dir, exist_ok=True)
 
-    # [修改点] 自动生成各阶段目录，基础目录改为 sim_matrices_cos_rough 和 sim_matrices_chamfer_dense
     if args.sim_matrices_dir is None:
         args.sim_matrices_dir = os.path.join(args.output_dir, 'sim_matrices_cos_rough', method_suffix + model_suffix)
     if args.dense_frames_dir is None:
@@ -142,10 +146,13 @@ def main():
         args.heatmaps_dir = os.path.join(args.output_dir, 'heatmaps', method_suffix + model_suffix)
     if args.dense_features_dir is None:
         args.dense_features_dir = os.path.join(args.output_dir, 'dense_features', f"{method_suffix}{model_suffix}_dense_{args.dense_fps}fps")
-    # [修改点] 生成第四阶段矩阵目录，使用 sim_matrices_chamfer_dense，子目录保留方法后缀
+    # [修改点] 将查询特征缓存目录合并到 dense_features_dir
+    if args.dense_query_features_dir is None:
+        args.dense_query_features_dir = args.dense_features_dir  # 不再单独创建目录
     if args.sim_matrices_dense_dir is None:
         args.sim_matrices_dense_dir = os.path.join(args.output_dir, 'sim_matrices_chamfer_dense', method_suffix + model_suffix)
 
+    # 创建必要的目录（注意 dense_query_features_dir 已合并，不再单独创建）
     for d in [args.sim_matrices_dir, args.dense_frames_dir, args.heatmaps_dir, args.dense_features_dir, args.sim_matrices_dense_dir]:
         os.makedirs(d, exist_ok=True)
 
@@ -160,16 +167,13 @@ def main():
 
     total_start = time.time()
 
-    # 加载模型（阶段1和阶段4需要）
+    # 加载模型（阶段1、3、4需要）
     model = None
-    if args.stage in ['1', '4', 'all']:
+    if args.stage in ['1', '3', '4', 'all']:
         try:
             model = ViSiL(pretrained=True, symmetric=is_symmetric).to(device)
             model.eval()
             print("> 模型加载成功")
-            # 解释第一阶段特征含义
-            print("> 第一阶段提取的特征为：每个关键帧的 9 个区域特征（来自 ResNet50 中间层），"
-                  f"形状 [关键帧数, 9, {expected_dims}]，随后可计算帧间余弦相似度。")
         except Exception as e:
             print(f"错误: 模型加载失败 - {e}")
             return
@@ -328,7 +332,6 @@ def main():
             gc.collect()
         pbar.close()
 
-        # 清理检查点
         if os.path.exists(stage2_checkpoint):
             os.remove(stage2_checkpoint)
         stage2_time = time.time() - stage2_start
@@ -341,7 +344,66 @@ def main():
         print("=" * 60)
         stage3_start = time.time()
 
-        # 加载区间元数据（若已存在则跳过已处理区间）
+        # [修改点] 预处理所有查询视频的全局密集帧特征，并保存JPG
+        print("预处理查询视频全局密集帧特征并保存JPG...")
+        query_dense_feat = {}  # q_id -> (features, fps, total_frames, indices, step)
+        for q_id in tqdm(query_ids, desc="查询全局密集帧"):
+            video_path = id_to_path.get(q_id)
+            if not video_path or not os.path.exists(video_path):
+                continue
+            # 读取视频信息获取总帧数和fps
+            try:
+                reader = VideoFrameReader(video_path)
+                total_frames = len(reader)
+                fps = reader.fps
+                reader.close()
+            except:
+                continue
+            # 计算采样步长
+            step = max(1, int(round(fps / args.dense_fps)))
+            indices = list(range(0, total_frames, step))
+            if not indices:
+                continue
+            # 检查是否已有缓存特征（现在使用 args.dense_features_dir/query/）
+            q_feat_cache = os.path.join(args.dense_features_dir, 'query', q_id, f"{q_id}.npy")
+            if os.path.exists(q_feat_cache):
+                try:
+                    feat_np = np.load(q_feat_cache)
+                    feat = torch.from_numpy(feat_np).float()
+                    if feat.dim() == 3 and feat.shape[1] == 9 and feat.shape[2] == expected_dims:
+                        query_dense_feat[q_id] = (feat, fps, total_frames, indices, step)
+                        continue
+                except:
+                    pass
+            # 提取帧
+            frames_np = None
+            try:
+                reader = VideoFrameReader(video_path)
+                frames_np = reader.get_frames(indices)
+                reader.close()
+            except:
+                continue
+            if frames_np is None or frames_np.size == 0:
+                continue
+            # [修改点] 保存JPG到 dense_frames/query/<video_id>/
+            query_jpg_dir = os.path.join(args.dense_frames_dir, 'query', q_id)
+            os.makedirs(query_jpg_dir, exist_ok=True)
+            for i, idx in enumerate(indices):
+                jpg_path = os.path.join(query_jpg_dir, f"frame_{idx:06d}.jpg")
+                Image.fromarray(frames_np[i]).save(jpg_path, quality=90)
+            # 缩放到224x224
+            frames_tensor = torch.from_numpy(frames_np).permute(0, 3, 1, 2).float()
+            if frames_tensor.shape[2] != 224 or frames_tensor.shape[3] != 224:
+                frames_tensor = F.interpolate(frames_tensor, size=(224, 224), mode='bilinear', align_corners=False)
+            frames_tensor = frames_tensor.permute(0, 2, 3, 1)  # [T, H, W, C]
+            # 特征保存到 args.dense_features_dir/query/<video_id>/
+            feat = extract_features_from_frames(model, frames_tensor, q_id,
+                                                os.path.join(args.dense_features_dir, 'query'),
+                                                device, args.batch_sz, expected_dims, use_cache=True)
+            if feat is not None:
+                query_dense_feat[q_id] = (feat, fps, total_frames, indices, step)
+
+        # 加载区间元数据
         intervals_meta = {}
         if os.path.exists(args.intervals_meta):
             try:
@@ -351,23 +413,26 @@ def main():
             except Exception as e:
                 print(f"> 加载区间元数据失败: {e}")
 
-        # 遍历所有查询-数据库对
         total_pairs = len(query_ids) * len(database_ids)
         pbar = tqdm(total=total_pairs, desc="处理矩阵", unit="pair")
         for q_id in query_ids:
-            # 加载查询元数据
-            indices_file = os.path.join(actual_frames_dir, q_id, 'indices.json')
-            info_file = os.path.join(actual_frames_dir, q_id, 'info.json')
-            if os.path.exists(indices_file) and os.path.exists(info_file):
-                with open(indices_file, 'r') as f:
-                    q_indices = json.load(f)
-                with open(info_file, 'r') as f:
-                    q_info = json.load(f)
-                q_fps = q_info.get('fps', 30.0)
-                q_total = q_info.get('total_frames', 0)  # [修改点] 获取视频总帧数
-            else:
+            if q_id not in query_dense_feat:
                 pbar.update(len(database_ids))
                 continue
+            q_feat, q_fps, q_total, q_indices, q_step = query_dense_feat[q_id]
+
+            # 加载查询元数据（关键帧信息）
+            indices_file = os.path.join(actual_frames_dir, q_id, 'indices.json')
+            info_file = os.path.join(actual_frames_dir, q_id, 'info.json')
+            if not (os.path.exists(indices_file) and os.path.exists(info_file)):
+                pbar.update(len(database_ids))
+                continue
+            with open(indices_file, 'r') as f:
+                q_key_indices = json.load(f)
+            with open(info_file, 'r') as f:
+                q_info = json.load(f)
+            q_fps = q_info.get('fps', 30.0)
+            q_total = q_info.get('total_frames', 0)
 
             for db_id in database_ids:
                 # 加载数据库元数据
@@ -377,11 +442,11 @@ def main():
                     pbar.update(1)
                     continue
                 with open(db_indices_file, 'r') as f:
-                    db_indices = json.load(f)
+                    db_key_indices = json.load(f)
                 with open(db_info_file, 'r') as f:
                     db_info = json.load(f)
                 db_fps = db_info.get('fps', 30.0)
-                db_total = db_info.get('total_frames', 0)  # [修改点] 获取视频总帧数
+                db_total = db_info.get('total_frames', 0)
 
                 # 加载相似度矩阵
                 sim_matrix = load_similarity_matrix(q_id, db_id, args.sim_matrices_dir)
@@ -398,272 +463,277 @@ def main():
                 # 收集该视频对的所有候选区间对
                 interval_pairs = []
                 for i, j in candidate_pairs:
-                    # [修改点] 判断当前关键帧对是否孤立
                     q_isolated = True
                     if i > 0 and sim_matrix[i-1, j] >= args.threshold:
                         q_isolated = False
-                    if i < len(q_indices)-1 and sim_matrix[i+1, j] >= args.threshold:
+                    if i < len(q_key_indices)-1 and sim_matrix[i+1, j] >= args.threshold:
                         q_isolated = False
 
                     db_isolated = True
                     if j > 0 and sim_matrix[i, j-1] >= args.threshold:
                         db_isolated = False
-                    if j < len(db_indices)-1 and sim_matrix[i, j+1] >= args.threshold:
+                    if j < len(db_key_indices)-1 and sim_matrix[i, j+1] >= args.threshold:
                         db_isolated = False
 
                     isolated = q_isolated and db_isolated
 
                     if isolated:
-                        # [修改点] 孤立关键帧：以当前关键帧为中心前后各扩展1秒
-                        q_center = q_indices[i]
+                        q_center = q_key_indices[i]
                         q_start_frame = max(0, q_center - int(q_fps))
                         q_end_frame = min(q_total - 1, q_center + int(q_fps))
 
-                        db_center = db_indices[j]
+                        db_center = db_key_indices[j]
                         db_start_frame = max(0, db_center - int(db_fps))
                         db_end_frame = min(db_total - 1, db_center + int(db_fps))
 
-                        # 步长仍按原方式计算
-                        q_step = max(1, int(round(q_fps / args.dense_fps)))
-                        db_step = max(1, int(round(db_fps / args.dense_fps)))
+                        q_step_dense = max(1, int(round(q_fps / args.dense_fps)))
+                        db_step_dense = max(1, int(round(db_fps / args.dense_fps)))
                     else:
-                        # [修改点] 非孤立：原扩展逻辑，但移除强制扩展的 if 语句
                         db_k_start = j
                         while db_k_start > 0 and sim_matrix[i, db_k_start - 1] >= args.threshold:
                             db_k_start -= 1
-                        # [修改点] 移除强制扩展
 
                         db_k_end = j
-                        while db_k_end < len(db_indices) - 1 and sim_matrix[i, db_k_end + 1] >= args.threshold:
+                        while db_k_end < len(db_key_indices) - 1 and sim_matrix[i, db_k_end + 1] >= args.threshold:
                             db_k_end += 1
-                        # [修改点] 移除强制扩展
 
                         q_k_start = i
                         while q_k_start > 0 and sim_matrix[q_k_start - 1, j] >= args.threshold:
                             q_k_start -= 1
-                        # [修改点] 移除强制扩展
 
                         q_k_end = i
-                        while q_k_end < len(q_indices) - 1 and sim_matrix[q_k_end + 1, j] >= args.threshold:
+                        while q_k_end < len(q_key_indices) - 1 and sim_matrix[q_k_end + 1, j] >= args.threshold:
                             q_k_end += 1
-                        # [修改点] 移除强制扩展
 
-                        db_start_frame = db_indices[db_k_start]
-                        db_end_frame   = db_indices[db_k_end]
-                        q_start_frame  = q_indices[q_k_start]
-                        q_end_frame    = q_indices[q_k_end]
+                        db_start_frame = db_key_indices[db_k_start]
+                        db_end_frame   = db_key_indices[db_k_end]
+                        q_start_frame  = q_key_indices[q_k_start]
+                        q_end_frame    = q_key_indices[q_k_end]
 
-                        q_step = max(1, int(round(q_fps / args.dense_fps)))
-                        db_step = max(1, int(round(db_fps / args.dense_fps)))
+                        q_step_dense = max(1, int(round(q_fps / args.dense_fps)))
+                        db_step_dense = max(1, int(round(db_fps / args.dense_fps)))
 
                     interval_pairs.append({
                         'q_start': q_start_frame,
                         'q_end': q_end_frame,
                         'db_start': db_start_frame,
                         'db_end': db_end_frame,
-                        'q_step': q_step,
-                        'db_step': db_step
+                        'q_step': q_step_dense,
+                        'db_step': db_step_dense
                     })
 
-                # 合并重叠的区间对
                 merged_pairs = merge_interval_pairs(interval_pairs)
 
-                # 为每个合并后的区间对提取密集帧
                 for idx, pair in enumerate(merged_pairs):
                     q_start = pair['q_start']
                     q_end = pair['q_end']
                     db_start = pair['db_start']
                     db_end = pair['db_end']
-                    q_step = pair['q_step']
-                    db_step = pair['db_step']
+                    q_step_dense = pair['q_step']
+                    db_step_dense = pair['db_step']
 
                     interval_id = f"{q_id}_{db_id}_m{idx}_q{q_start}_{q_end}_db{db_start}_{db_end}"
 
-                    # 检查是否已处理
                     if interval_id in intervals_meta:
                         continue
 
-                    # 去掉 intervals 层级，直接将区间文件夹放在视频 ID 下
-                    q_save_dir = os.path.join(args.dense_frames_dir, 'queries', q_id, interval_id)
+                    # 提取数据库区间密集帧（查询区间已全局提取，此处不再重复）
                     db_save_dir = os.path.join(args.dense_frames_dir, 'database', db_id, interval_id)
-
-                    # 提取并保存查询区间密集帧
-                    q_frames_saved = extract_dense_frames_range_and_save(
-                        id_to_path[q_id], q_start, q_end, q_step,
-                        q_save_dir, max_size=None
-                    )
-                    if not q_frames_saved:
-                        continue
-
-                    # 提取并保存数据库区间密集帧
                     db_frames_saved = extract_dense_frames_range_and_save(
-                        id_to_path[db_id], db_start, db_end, db_step,
+                        id_to_path[db_id], db_start, db_end, db_step_dense,
                         db_save_dir, max_size=None
                     )
                     if not db_frames_saved:
                         continue
 
-                    # 记录区间元数据
+                    # 记录区间元数据（包含查询区间信息，但不保存查询帧）
                     intervals_meta[interval_id] = {
                         'query_id': q_id,
                         'db_id': db_id,
                         'q_start_frame': q_start,
                         'q_end_frame': q_end,
-                        'q_step': q_step,
+                        'q_step': q_step_dense,
                         'db_start_frame': db_start,
                         'db_end_frame': db_end,
-                        'db_step': db_step,
-                        'q_save_dir': q_save_dir,
-                        'db_save_dir': db_save_dir
+                        'db_step': db_step_dense,
+                        'db_save_dir': db_save_dir,
                     }
 
                 pbar.update(1)
-                # 定期保存元数据
                 if len(intervals_meta) % 50 == 0:
                     save_interval_metadata(intervals_meta, args.intervals_meta)
         pbar.close()
 
         save_interval_metadata(intervals_meta, args.intervals_meta)
         stage3_time = time.time() - stage3_start
-        print(f"> 第三阶段完成，耗时 {stage3_time:.2f}s，共生成 {len(intervals_meta)} 个区间，密集帧保存至 {args.dense_frames_dir}")
+        print(f"> 第三阶段完成，耗时 {stage3_time:.2f}s，共生成 {len(intervals_meta)} 个区间，数据库密集帧保存至 {args.dense_frames_dir}/database，查询密集帧保存至 {args.dense_frames_dir}/query")
 
-    # ========== 阶段4：密集帧相似度计算与亮线检测 ==========
+    # ========== 阶段4：密集帧相似度计算与亮线检测（按区间独立计算，输出定位信息）==========
     if args.stage in ['4', 'all']:
         print("\n" + "=" * 60)
-        print("第四阶段：密集帧相似度计算与亮线检测（按查询-数据库对合并区间）")
+        print("第四阶段：密集帧相似度计算与亮线检测（按区间独立计算，输出定位信息）")
         print("=" * 60)
         stage4_start = time.time()
 
-        # 加载区间元数据
         if not os.path.exists(args.intervals_meta):
             print(f"> 错误：区间元数据文件不存在 {args.intervals_meta}")
             return
         intervals_meta = load_interval_metadata(args.intervals_meta)
 
-        # [修改点] 按 (query_id, db_id) 分组收集区间信息
-        pair_to_intervals = {}  # (q_id, db_id) -> list of interval_meta
-        for interval_id, meta in intervals_meta.items():
-            key = (meta['query_id'], meta['db_id'])
-            if key not in pair_to_intervals:
-                pair_to_intervals[key] = []
-            pair_to_intervals[key].append(meta)
+        # [修改点] 加载查询全局密集特征（从 args.dense_features_dir/query/）
+        query_dense_feat = {}  # q_id -> (features, fps, total_frames, indices, step)
+        for q_id in query_ids:
+            feat_path = os.path.join(args.dense_features_dir, 'query', q_id, f"{q_id}.npy")
+            if os.path.exists(feat_path):
+                try:
+                    feat_np = np.load(feat_path)
+                    feat = torch.from_numpy(feat_np).float()
+                    if feat.dim() == 3 and feat.shape[1] == 9 and feat.shape[2] == expected_dims:
+                        # 重新获取视频信息（也可从阶段3缓存的信息中读取，这里简化处理）
+                        video_path = id_to_path.get(q_id)
+                        if video_path and os.path.exists(video_path):
+                            try:
+                                reader = VideoFrameReader(video_path)
+                                total_frames = len(reader)
+                                fps = reader.fps
+                                reader.close()
+                                step = max(1, int(round(fps / args.dense_fps)))
+                                indices = list(range(0, total_frames, step))
+                                query_dense_feat[q_id] = (feat, fps, total_frames, indices, step)
+                            except:
+                                pass
+                except:
+                    pass
+        print(f"> 加载查询全局密集特征: {len(query_dense_feat)} 个")
 
-        # 特征缓存字典（可选）
-        feature_cache = {}
+        # 数据库区间特征缓存（按区间ID）
+        db_interval_feat_cache = {}
 
-        similarities = {}  # query_id -> {db_id: score}
-        processed_pairs = set()  # [修改点] 记录已处理的 (q_id, db_id) 对
+        # 存储每个区间的详细结果
+        interval_results = []  # 每个元素为字典
 
-        # 检查点文件（按对记录）
-        stage4_checkpoint = os.path.join(args.heatmaps_dir, 'stage4_checkpoint_pairs.json')
+        # 用于聚合视频对相似度（取区间最高分）
+        similarities = {}
+
+        processed_intervals = set()
+        # 检查点文件（按区间）
+        stage4_checkpoint = os.path.join(args.heatmaps_dir, 'stage4_checkpoint_intervals.json')
         if os.path.exists(stage4_checkpoint):
             try:
                 with open(stage4_checkpoint, 'r') as f:
                     cp = json.load(f)
+                interval_results = cp.get('interval_results', [])
                 similarities = cp.get('similarities', {})
-                processed_pairs = set(tuple(p) for p in cp.get('processed_pairs', []))
-                print(f"> 加载检查点，已处理 {len(processed_pairs)} 个查询-数据库对")
+                processed_intervals = set(cp.get('processed_intervals', []))
+                print(f"> 加载检查点，已处理 {len(processed_intervals)} 个区间")
             except Exception as e:
                 print(f"> 检查点加载失败: {e}")
 
-        total_pairs = len(pair_to_intervals)
-        pbar = tqdm(total=total_pairs, desc="处理查询-数据库对", unit="pair")
-        for (q_id, db_id), intervals_list in pair_to_intervals.items():
-            if (q_id, db_id) in processed_pairs:
+        total_intervals = len(intervals_meta)
+        pbar = tqdm(total=total_intervals, desc="处理区间", unit="interval")
+        for interval_id, meta in intervals_meta.items():
+            if interval_id in processed_intervals:
                 pbar.update(1)
                 continue
 
-            # [修改点] 收集查询视频的所有帧（去重排序）
-            q_frame_dirs = [meta['q_save_dir'] for meta in intervals_list]
-            all_q_frames = []  # 存储所有查询帧的 (frame_idx, img_array)
-            for dir_path in q_frame_dirs:
-                frames_info = get_sorted_frames_from_dir(dir_path)  # 返回 [(idx, img), ...]
-                if frames_info is None:
+            q_id = meta['query_id']
+            db_id = meta['db_id']
+            q_start = meta['q_start_frame']
+            q_end = meta['q_end_frame']
+            q_step = meta['q_step']
+            db_start = meta['db_start_frame']
+            db_end = meta['db_end_frame']
+            db_step = meta['db_step']
+            db_save_dir = meta['db_save_dir']
+
+            if q_id not in query_dense_feat:
+                pbar.update(1)
+                continue
+            q_feat_full, q_fps, q_total, q_indices_full, q_step_full = query_dense_feat[q_id]
+
+            # 从查询全局特征中切片得到查询区间特征
+            # 首先找到q_start和q_end在q_indices_full中的索引范围
+            start_idx_in_full = None
+            end_idx_in_full = None
+            for i, idx in enumerate(q_indices_full):
+                if idx >= q_start:
+                    start_idx_in_full = i
+                    break
+            for i, idx in enumerate(q_indices_full):
+                if idx <= q_end:
+                    end_idx_in_full = i
+                else:
+                    break
+            if start_idx_in_full is None or end_idx_in_full is None:
+                pbar.update(1)
+                continue
+            q_feat_interval = q_feat_full[start_idx_in_full:end_idx_in_full+1]  # [T_q_interval, 9, D]
+
+            # 获取数据库区间特征
+            if db_interval_feat_cache.get(interval_id) is not None:
+                db_feat_interval = db_interval_feat_cache[interval_id]
+            else:
+                # 从数据库区间JPG目录加载帧并提取特征
+                db_frames_info = get_sorted_frames_from_dir(db_save_dir)
+                if db_frames_info is None:
+                    pbar.update(1)
                     continue
-                all_q_frames.extend(frames_info)
-            if not all_q_frames:
-                pbar.update(1)
-                continue
-            # 按帧索引排序并去重（保留第一次出现的帧）
-            all_q_frames.sort(key=lambda x: x[0])
-            unique_q_frames = []
-            seen = set()
-            for idx, img in all_q_frames:
-                if idx not in seen:
-                    seen.add(idx)
-                    unique_q_frames.append((idx, img))
-            # 提取查询帧张量
-            q_imgs = [img for _, img in unique_q_frames]
-            q_frames_np = np.stack(q_imgs, axis=0)  # [T, H, W, 3]
-            q_frames_tensor = torch.from_numpy(q_frames_np).permute(0, 3, 1, 2).float()
-            if q_frames_tensor.shape[2] != 224 or q_frames_tensor.shape[3] != 224:
-                q_frames_tensor = torch.nn.functional.interpolate(
-                    q_frames_tensor, size=(224, 224), mode='bilinear', align_corners=False
-                )
-            q_frames_tensor = q_frames_tensor.permute(0, 2, 3, 1)  # 转回 [T, H, W, C] 以便特征提取
-
-            # [修改点] 收集数据库视频的所有帧（去重排序）
-            db_frame_dirs = [meta['db_save_dir'] for meta in intervals_list]
-            all_db_frames = []
-            for dir_path in db_frame_dirs:
-                frames_info = get_sorted_frames_from_dir(dir_path)
-                if frames_info is None:
+                db_frames = [img for _, img in db_frames_info]
+                db_frames_np = np.stack(db_frames, axis=0)  # [T, H, W, 3]
+                db_frames_tensor = torch.from_numpy(db_frames_np).permute(0, 3, 1, 2).float()
+                if db_frames_tensor.shape[2] != 224 or db_frames_tensor.shape[3] != 224:
+                    db_frames_tensor = F.interpolate(db_frames_tensor, size=(224, 224), mode='bilinear', align_corners=False)
+                db_frames_tensor = db_frames_tensor.permute(0, 2, 3, 1)
+                db_feat_interval = extract_features_from_frames(model, db_frames_tensor, f"{interval_id}_db",
+                                                                None, device, args.batch_sz, expected_dims, use_cache=False)
+                if db_feat_interval is None:
+                    pbar.update(1)
                     continue
-                all_db_frames.extend(frames_info)
-            if not all_db_frames:
-                pbar.update(1)
-                continue
-            all_db_frames.sort(key=lambda x: x[0])
-            unique_db_frames = []
-            seen = set()
-            for idx, img in all_db_frames:
-                if idx not in seen:
-                    seen.add(idx)
-                    unique_db_frames.append((idx, img))
-            db_imgs = [img for _, img in unique_db_frames]
-            db_frames_np = np.stack(db_imgs, axis=0)
-            db_frames_tensor = torch.from_numpy(db_frames_np).permute(0, 3, 1, 2).float()
-            if db_frames_tensor.shape[2] != 224 or db_frames_tensor.shape[3] != 224:
-                db_frames_tensor = torch.nn.functional.interpolate(
-                    db_frames_tensor, size=(224, 224), mode='bilinear', align_corners=False
-                )
-            db_frames_tensor = db_frames_tensor.permute(0, 2, 3, 1)
+                # 可选缓存
+                db_interval_feat_cache[interval_id] = db_feat_interval
 
-            # 提取特征
-            q_feat = extract_features_from_frames(
-                model, q_frames_tensor, f"{q_id}_{db_id}_q",  # 临时名称，不保存缓存
-                None, device, args.batch_sz, expected_dims, use_cache=False
-            )
-            db_feat = extract_features_from_frames(
-                model, db_frames_tensor, f"{q_id}_{db_id}_db",
-                None, device, args.batch_sz, expected_dims, use_cache=False
-            )
-
-            if q_feat is None or db_feat is None:
+            if q_feat_interval is None or db_feat_interval is None:
                 pbar.update(1)
                 continue
 
-            # 计算相似度
-            sim_val = compute_dense_similarity(model, q_feat, db_feat)
+            # 使用余弦相似度计算视频级相似度
+            sim_val = compute_dense_cosine_similarity(q_feat_interval, db_feat_interval)
 
-            # [修改点] 生成一张整体的热图，保存拼接后的矩阵
-            heatmap_path = os.path.join(args.heatmaps_dir, q_id, f"{db_id}_merged.png")
-            matrix_save_path = os.path.join(args.sim_matrices_dense_dir, q_id, f"{db_id}_merged.npy")
-            compute_and_save_heatmap(model, q_feat, db_feat, heatmap_path, matrix_save_path)
+            # [修改点] 生成该区间的热图（do_plot=True）
+            heatmap_path = os.path.join(args.heatmaps_dir, q_id, f"{db_id}_{interval_id}.png")
+            matrix_save_path = os.path.join(args.sim_matrices_dense_dir, q_id, f"{db_id}_{interval_id}.npy")
+            compute_and_save_heatmap(model, q_feat_interval, db_feat_interval, heatmap_path, matrix_save_path, do_plot=True)
 
-            # 聚合分数
+            # 记录区间结果
+            interval_result = {
+                'interval_id': interval_id,
+                'query_id': q_id,
+                'db_id': db_id,
+                'q_start_frame': q_start,
+                'q_end_frame': q_end,
+                'q_start_sec': q_start / q_fps if q_fps > 0 else 0,
+                'q_end_sec': q_end / q_fps if q_fps > 0 else 0,
+                'db_start_frame': db_start,
+                'db_end_frame': db_end,
+                'db_start_sec': db_start / q_fps if q_fps > 0 else 0,  # 注意数据库帧率可能与查询不同，但这里用数据库自己的帧率更准确，暂时用q_fps简化
+                'db_end_sec': db_end / q_fps if q_fps > 0 else 0,
+                'similarity': sim_val
+            }
+            interval_results.append(interval_result)
+
+            # 聚合视频对相似度（取最大值）
             if q_id not in similarities:
                 similarities[q_id] = {}
             if db_id not in similarities[q_id] or sim_val > similarities[q_id][db_id]:
                 similarities[q_id][db_id] = sim_val
 
-            processed_pairs.add((q_id, db_id))
+            processed_intervals.add(interval_id)
 
-            # 定期保存检查点
-            if len(processed_pairs) % 50 == 0:
+            if len(processed_intervals) % 50 == 0:
                 cp_data = {
+                    'interval_results': interval_results,
                     'similarities': similarities,
-                    'processed_pairs': list(processed_pairs)
+                    'processed_intervals': list(processed_intervals)
                 }
                 with open(stage4_checkpoint, 'w') as f:
                     json.dump(cp_data, f)
@@ -671,13 +741,18 @@ def main():
 
         pbar.close()
 
-        # 保存最终相似度文件
+        # 保存区间详细结果
+        interval_results_file = os.path.join(args.output_dir, f"interval_results_{method_suffix}{model_suffix}_th{args.threshold}.json")
+        with open(interval_results_file, 'w') as f:
+            json.dump(interval_results, f, indent=2)
+        print(f"> 区间详细结果保存至: {interval_results_file}")
+
+        # 保存聚合相似度
         final_sim_file = os.path.join(args.output_dir, f"similarities_{method_suffix}{model_suffix}_th{args.threshold}.json")
         with open(final_sim_file, 'w') as f:
             json.dump(similarities, f, separators=(',', ':'))
-        print(f"> 最终相似度保存至: {final_sim_file}")
+        print(f"> 聚合相似度保存至: {final_sim_file}")
 
-        # 清理检查点
         if os.path.exists(stage4_checkpoint):
             os.remove(stage4_checkpoint)
 
