@@ -99,14 +99,28 @@ class FIVR(object):
         """
         self.version = version
 
-        # 从pickle文件加载数据集元数据（包含标注信息、查询集、数据库等）
-        with open('datasets/fivr-filtered.pickle', 'rb') as f:
+        # [修改点] 修正 pickle 文件路径，优先使用 FIVR-200K-Downloader 目录下的文件
+        possible_paths = [
+            'datasets/FIVR-200K-Downloader/fivr-filtered.pickle',
+            'datasets/fivr-filtered.pickle'
+        ]
+        pickle_path = None
+        for p in possible_paths:
+            if os.path.exists(p):
+                pickle_path = p
+                break
+        if pickle_path is None:
+            raise FileNotFoundError(
+                "找不到 FIVR 数据集 pickle 文件，请确保 fivr-filtered.pickle 存在于 "
+                "datasets/ 或 datasets/FIVR-200K-Downloader/ 目录下"
+            )
+
+        with open(pickle_path, 'rb') as f:
             dataset = pk.load(f)
 
         self.name = 'FIVR'  # 数据集名称
 
         # annotation: 字典，key是查询视频ID，value是该视频的相关视频分类标注
-        # 相关视频按相似程度分为：ND(复制), DS(相同场景), CS(相同事件), IS(同一事件)
         self.annotation = dataset['annotation']
 
         # 根据版本选择对应的查询集和数据库
@@ -244,7 +258,6 @@ class FIVR(object):
 
         # 返回三种指标的平均值
         return {'DSVR': np.mean(DSVR), 'CSVR': np.mean(CSVR), 'ISVR': np.mean(ISVR)}
-
 
 class EVVE(object):
 

@@ -86,7 +86,7 @@ DATASET_PRESETS = {
 
 def main():
     parser = argparse.ArgumentParser(description='四阶段视频相似度评估')
-    parser.add_argument('--dataset', type=str, default="VCDB",
+    parser.add_argument('--dataset', type=str, default="FIVR-5K",
                         choices=list(DATASET_PRESETS.keys()),
                         help='评估数据集名称')
     parser.add_argument('--video_dir', type=str, default=None)
@@ -95,7 +95,10 @@ def main():
     parser.add_argument('--database_file', type=str, default=None)
     parser.add_argument('--first_stage_method', type=str, default='iframe',
                         choices=['default', '2s', 'local_maxima', 'iframe', 'i_p_mixed'])
-    parser.add_argument('--threshold', type=float, default=0.4)
+    parser.add_argument('--threshold', type=float, default=0.1)
+    # [修改点] 二分类检测阈值参数
+    parser.add_argument('--detection_threshold', type=float, default=0.1,
+                        help='若提供，将在阶段四后输出二分类检测结果并计算评估指标')
     parser.add_argument('--max_keyframes', type=int, default=0)
     parser.add_argument('--lm_threshold', type=float, default=0.6)
     parser.add_argument('--dense_fps', type=float, default=1.0)
@@ -108,8 +111,9 @@ def main():
     parser.add_argument('--features_dir', type=str, default='features1')
     parser.add_argument('--output_dir', type=str, default='output')
     parser.add_argument('--ffprobe_path', type=str, default='ffprobe')
+    # [修改点] 增加第五阶段选项
     parser.add_argument('--stage', type=str, default='all',
-                        choices=['1', '2', '3', '4', 'all'])
+                        choices=['1', '2', '3', '4', '5', 'all'])
     parser.add_argument('--sim_matrices_dir', type=str, default=None)
     parser.add_argument('--dense_frames_dir', type=str, default=None)
     parser.add_argument('--intervals_meta', type=str, default=None)
@@ -117,6 +121,7 @@ def main():
     parser.add_argument('--dense_features_dir', type=str, default=None)
     parser.add_argument('--sim_matrices_dense_dir', type=str, default=None)
     parser.add_argument('--only_first_stage', action='store_true', default=False)
+
 
     args = parser.parse_args()
 
@@ -598,6 +603,7 @@ def main():
     stage2_time = 0.0
     stage3_time = 0.0
     stage4_time = 0.0
+    stage5_time = 0.0
 
     # ========== 阶段1 ==========
     if args.stage in ['1', 'all']:
@@ -616,7 +622,7 @@ def main():
         stage2_time = run_stage2()
 
     # ========== 阶段3+4 ==========
-    if args.stage in ['3', 'all']:
+    if args.stage in ['3', '4', 'all']:
         if 'model' not in locals() or model is None:
             try:
                 model = ViSiL(pretrained=True, symmetric=is_symmetric).to(device)
@@ -638,7 +644,7 @@ def main():
         else:
             need_stage1 = True
 
-        if need_stage1:
+        if need_stage1 and args.stage != '4':
             print("> 检测到阶段1特征缺失，自动执行阶段1...")
             stage1_time = run_stage1(model, device)
 
@@ -654,342 +660,495 @@ def main():
                     break
         need_stage2 = len(sim_mat_files) == 0
 
-        if need_stage2:
+        if need_stage2 and args.stage != '4':
             print("> 检测到阶段2矩阵缺失，自动执行阶段2...")
             stage2_time = run_stage2()
 
         # 阶段3：密集帧区间提取
-        print("\n" + "=" * 60)
-        print("第三阶段：候选区间定位与密集帧提取")
-        print("=" * 60)
-        stage3_start = time.time()
+        if args.stage in ['3', 'all']:
+            print("\n" + "=" * 60)
+            print("第三阶段：候选区间定位与密集帧提取")
+            print("=" * 60)
+            stage3_start = time.time()
 
-        intervals_meta = {}
-        if os.path.exists(args.intervals_meta):
-            try:
-                with open(args.intervals_meta, 'r') as f:
-                    intervals_meta = json.load(f)
-                print(f"> 加载区间元数据，已有 {len(intervals_meta)} 个区间")
-            except Exception as e:
-                print(f"> 加载区间元数据失败: {e}")
+            intervals_meta = {}
+            if os.path.exists(args.intervals_meta):
+                try:
+                    with open(args.intervals_meta, 'r') as f:
+                        intervals_meta = json.load(f)
+                    print(f"> 加载区间元数据，已有 {len(intervals_meta)} 个区间")
+                except Exception as e:
+                    print(f"> 加载区间元数据失败: {e}")
 
-        query_full_frames_extracted = set()
+            query_full_frames_extracted = set()
 
-        total_pairs = len(query_ids) * len(database_ids)
-        pbar = tqdm(total=total_pairs, desc="处理矩阵", unit="pair")
-        for q_id in query_ids:
-            indices_file = os.path.join(actual_frames_dir, q_id, 'indices.json')
-            info_file = os.path.join(actual_frames_dir, q_id, 'info.json')
-            if os.path.exists(indices_file) and os.path.exists(info_file):
-                with open(indices_file, 'r') as f:
-                    q_indices = json.load(f)
-                with open(info_file, 'r') as f:
-                    q_info = json.load(f)
-                q_fps = q_info.get('fps', 30.0)
-                q_total = q_info.get('total_frames', 0)
-            else:
-                pbar.update(len(database_ids))
-                continue
-
-            if q_id not in query_full_frames_extracted:
-                num_frames = extract_full_dense_frames(id_to_path[q_id], q_id, args.dense_frames_dir, args.dense_fps)
-                if num_frames > 0:
-                    query_full_frames_extracted.add(q_id)
-
-            for db_id in database_ids:
-                db_indices_file = os.path.join(actual_frames_dir, db_id, 'indices.json')
-                db_info_file = os.path.join(actual_frames_dir, db_id, 'info.json')
-                if not (os.path.exists(db_indices_file) and os.path.exists(db_info_file)):
-                    pbar.update(1)
-                    continue
-                with open(db_indices_file, 'r') as f:
-                    db_indices = json.load(f)
-                with open(db_info_file, 'r') as f:
-                    db_info = json.load(f)
-                db_fps = db_info.get('fps', 30.0)
-                db_total = db_info.get('total_frames', 0)
-
-                sim_matrix = load_similarity_matrix(q_id, db_id, args.sim_matrices_dir)
-                if sim_matrix is None:
-                    pbar.update(1)
+            total_pairs = len(query_ids) * len(database_ids)
+            pbar = tqdm(total=total_pairs, desc="处理矩阵", unit="pair")
+            for q_id in query_ids:
+                indices_file = os.path.join(actual_frames_dir, q_id, 'indices.json')
+                info_file = os.path.join(actual_frames_dir, q_id, 'info.json')
+                if os.path.exists(indices_file) and os.path.exists(info_file):
+                    with open(indices_file, 'r') as f:
+                        q_indices = json.load(f)
+                    with open(info_file, 'r') as f:
+                        q_info = json.load(f)
+                    q_fps = q_info.get('fps', 30.0)
+                    q_total = q_info.get('total_frames', 0)
+                else:
+                    pbar.update(len(database_ids))
                     continue
 
-                candidate_pairs = find_candidate_pairs(sim_matrix, args.threshold)
-                if not candidate_pairs:
-                    pbar.update(1)
-                    continue
+                if q_id not in query_full_frames_extracted:
+                    num_frames = extract_full_dense_frames(id_to_path[q_id], q_id, args.dense_frames_dir, args.dense_fps)
+                    if num_frames > 0:
+                        query_full_frames_extracted.add(q_id)
 
-                db_intervals = []
-                for i, j in candidate_pairs:
-                    db_isolated = True
-                    if j > 0 and sim_matrix[i, j-1] >= args.threshold:
-                        db_isolated = False
-                    if j < len(db_indices)-1 and sim_matrix[i, j+1] >= args.threshold:
-                        db_isolated = False
+                for db_id in database_ids:
+                    db_indices_file = os.path.join(actual_frames_dir, db_id, 'indices.json')
+                    db_info_file = os.path.join(actual_frames_dir, db_id, 'info.json')
+                    if not (os.path.exists(db_indices_file) and os.path.exists(db_info_file)):
+                        pbar.update(1)
+                        continue
+                    with open(db_indices_file, 'r') as f:
+                        db_indices = json.load(f)
+                    with open(db_info_file, 'r') as f:
+                        db_info = json.load(f)
+                    db_fps = db_info.get('fps', 30.0)
+                    db_total = db_info.get('total_frames', 0)
 
-                    if db_isolated:
-                        db_center = db_indices[j]
-                        db_start = max(0, db_center - int(db_fps))
-                        db_end = min(db_total - 1, db_center + int(db_fps))
-                    else:
-                        db_k_start = j
-                        while db_k_start > 0 and sim_matrix[i, db_k_start - 1] >= args.threshold:
-                            db_k_start -= 1
-                        db_k_end = j
-                        while db_k_end < len(db_indices) - 1 and sim_matrix[i, db_k_end + 1] >= args.threshold:
-                            db_k_end += 1
-                        db_start = db_indices[db_k_start]
-                        db_end = db_indices[db_k_end]
-
-                    step = max(1, int(round(db_fps / args.dense_fps)))
-                    db_intervals.append({
-                        'db_start': db_start,
-                        'db_end': db_end,
-                        'db_step': step
-                    })
-
-                merged_db = merge_db_intervals(db_intervals)
-
-                for idx, db_int in enumerate(merged_db):
-                    db_start = db_int['db_start']
-                    db_end = db_int['db_end']
-                    db_step = db_int['db_step']
-
-                    interval_id = f"{q_id}_{db_id}_db{db_start}_{db_end}_step{db_step}"
-                    db_save_dir = os.path.join(args.dense_frames_dir, 'database', db_id, interval_id)
-
-                    if interval_id in intervals_meta:
+                    sim_matrix = load_similarity_matrix(q_id, db_id, args.sim_matrices_dir)
+                    if sim_matrix is None:
+                        pbar.update(1)
                         continue
 
-                    db_frames_saved = extract_dense_frames_range_and_save(
-                        id_to_path[db_id], db_start, db_end, db_step,
-                        db_save_dir, max_size=None
-                    )
-                    if db_frames_saved == 0:
+                    candidate_pairs = find_candidate_pairs(sim_matrix, args.threshold)
+                    if not candidate_pairs:
+                        pbar.update(1)
                         continue
 
-                    intervals_meta[interval_id] = {
-                        'query_id': q_id,
-                        'db_id': db_id,
-                        'db_start_frame': db_start,
-                        'db_end_frame': db_end,
-                        'db_step': db_step,
-                        'db_save_dir': db_save_dir,
-                        'query_full_dir': os.path.join(args.dense_frames_dir, 'queries', q_id, 'full')
-                    }
+                    db_intervals = []
+                    for i, j in candidate_pairs:
+                        db_isolated = True
+                        if j > 0 and sim_matrix[i, j-1] >= args.threshold:
+                            db_isolated = False
+                        if j < len(db_indices)-1 and sim_matrix[i, j+1] >= args.threshold:
+                            db_isolated = False
 
-                pbar.update(1)
-                if len(intervals_meta) % 50 == 0:
-                    save_interval_metadata(intervals_meta, args.intervals_meta)
-        pbar.close()
+                        if db_isolated:
+                            db_center = db_indices[j]
+                            db_start = max(0, db_center - int(db_fps))
+                            db_end = min(db_total - 1, db_center + int(db_fps))
+                        else:
+                            db_k_start = j
+                            while db_k_start > 0 and sim_matrix[i, db_k_start - 1] >= args.threshold:
+                                db_k_start -= 1
+                            db_k_end = j
+                            while db_k_end < len(db_indices) - 1 and sim_matrix[i, db_k_end + 1] >= args.threshold:
+                                db_k_end += 1
+                            db_start = db_indices[db_k_start]
+                            db_end = db_indices[db_k_end]
 
-        save_interval_metadata(intervals_meta, args.intervals_meta)
-        stage3_time = time.time() - stage3_start
-        print(f"> 第三阶段完成，耗时 {stage3_time:.2f}s，共生成 {len(intervals_meta)} 个数据库区间")
+                        step = max(1, int(round(db_fps / args.dense_fps)))
+                        db_intervals.append({
+                            'db_start': db_start,
+                            'db_end': db_end,
+                            'db_step': step
+                        })
 
-        if len(intervals_meta) == 0:
-            print("> 警告：未找到任何候选区间，跳过第四阶段和评估。")
-            return
+                    merged_db = merge_db_intervals(db_intervals)
+
+                    for idx, db_int in enumerate(merged_db):
+                        db_start = db_int['db_start']
+                        db_end = db_int['db_end']
+                        db_step = db_int['db_step']
+
+                        interval_id = f"{q_id}_{db_id}_db{db_start}_{db_end}_step{db_step}"
+                        db_save_dir = os.path.join(args.dense_frames_dir, 'database', db_id, interval_id)
+
+                        if interval_id in intervals_meta:
+                            continue
+
+                        db_frames_saved = extract_dense_frames_range_and_save(
+                            id_to_path[db_id], db_start, db_end, db_step,
+                            db_save_dir, max_size=None
+                        )
+                        if db_frames_saved == 0:
+                            continue
+
+                        intervals_meta[interval_id] = {
+                            'query_id': q_id,
+                            'db_id': db_id,
+                            'db_start_frame': db_start,
+                            'db_end_frame': db_end,
+                            'db_step': db_step,
+                            'db_save_dir': db_save_dir,
+                            'query_full_dir': os.path.join(args.dense_frames_dir, 'queries', q_id, 'full')
+                        }
+
+                    pbar.update(1)
+                    if len(intervals_meta) % 50 == 0:
+                        save_interval_metadata(intervals_meta, args.intervals_meta)
+            pbar.close()
+
+            save_interval_metadata(intervals_meta, args.intervals_meta)
+            stage3_time = time.time() - stage3_start
+            print(f"> 第三阶段完成，耗时 {stage3_time:.2f}s，共生成 {len(intervals_meta)} 个数据库区间")
+
+            if len(intervals_meta) == 0:
+                print("> 警告：未找到任何候选区间，跳过第四阶段和评估。")
+                return
 
         # 阶段4：密集帧相似度计算
-        print("\n" + "=" * 60)
-        print("第四阶段：密集帧相似度计算与亮线检测")
-        print("=" * 60)
-        stage4_start = time.time()
+        if args.stage in ['4', 'all']:
+            # 如果只运行阶段4，需要加载intervals_meta
+            if args.stage == '4' and not intervals_meta:
+                if os.path.exists(args.intervals_meta):
+                    with open(args.intervals_meta, 'r') as f:
+                        intervals_meta = json.load(f)
+                else:
+                    print("> 错误：阶段4需要区间元数据，但未找到。请先运行阶段3。")
+                    return
 
-        pair_to_intervals = {}
-        for interval_id, meta in intervals_meta.items():
-            key = (meta['query_id'], meta['db_id'])
-            if key not in pair_to_intervals:
-                pair_to_intervals[key] = []
-            pair_to_intervals[key].append(meta)
+            print("\n" + "=" * 60)
+            print("第四阶段：密集帧相似度计算与亮线检测")
+            print("=" * 60)
+            stage4_start = time.time()
 
-        feature_cache = {}
-        similarities = {}
-        processed_pairs = set()
+            pair_to_intervals = {}
+            for interval_id, meta in intervals_meta.items():
+                key = (meta['query_id'], meta['db_id'])
+                if key not in pair_to_intervals:
+                    pair_to_intervals[key] = []
+                pair_to_intervals[key].append(meta)
 
-        stage4_checkpoint = os.path.join(args.heatmaps_dir, 'stage4_checkpoint_pairs.json')
-        if os.path.exists(stage4_checkpoint):
-            try:
-                with open(stage4_checkpoint, 'r') as f:
-                    cp = json.load(f)
-                similarities = cp.get('similarities', {})
-                processed_pairs = set(tuple(p) for p in cp.get('processed_pairs', []))
-                print(f"> 加载检查点，已处理 {len(processed_pairs)} 个查询-数据库对")
-            except Exception as e:
-                print(f"> 检查点加载失败: {e}")
+            feature_cache = {}
+            similarities = {}
+            processed_pairs = set()
 
-        total_pairs = len(pair_to_intervals)
-        pbar = tqdm(total=total_pairs, desc="处理查询-数据库对", unit="pair")
-        for (q_id, db_id), intervals_list in pair_to_intervals.items():
-            if (q_id, db_id) in processed_pairs:
-                pbar.update(1)
-                continue
+            stage4_checkpoint = os.path.join(args.heatmaps_dir, 'stage4_checkpoint_pairs.json')
+            if os.path.exists(stage4_checkpoint):
+                try:
+                    with open(stage4_checkpoint, 'r') as f:
+                        cp = json.load(f)
+                    similarities = cp.get('similarities', {})
+                    processed_pairs = set(tuple(p) for p in cp.get('processed_pairs', []))
+                    print(f"> 加载检查点，已处理 {len(processed_pairs)} 个查询-数据库对")
+                except Exception as e:
+                    print(f"> 检查点加载失败: {e}")
 
-            # 加载查询全局特征
-            query_feat_key = f"query_full_{q_id}"
-            if query_feat_key in feature_cache:
-                q_feat = feature_cache[query_feat_key]
-            else:
-                query_full_dir = intervals_list[0]['query_full_dir']
-                query_feat_path = os.path.join(args.dense_features_dir, 'queries', q_id, f"{q_id}_full.npy")
-                if os.path.exists(query_feat_path):
-                    try:
-                        q_feat_np = np.load(query_feat_path)
-                        q_feat = torch.from_numpy(q_feat_np).float()
-                        if q_feat.dim() == 3 and q_feat.shape[1] == 9 and q_feat.shape[2] == expected_dims:
-                            feature_cache[query_feat_key] = q_feat
-                        else:
+            total_pairs = len(pair_to_intervals)
+            pbar = tqdm(total=total_pairs, desc="处理查询-数据库对", unit="pair")
+            for (q_id, db_id), intervals_list in pair_to_intervals.items():
+                if (q_id, db_id) in processed_pairs:
+                    pbar.update(1)
+                    continue
+
+                # 加载查询全局特征
+                query_feat_key = f"query_full_{q_id}"
+                if query_feat_key in feature_cache:
+                    q_feat = feature_cache[query_feat_key]
+                else:
+                    query_full_dir = intervals_list[0]['query_full_dir']
+                    query_feat_path = os.path.join(args.dense_features_dir, 'queries', q_id, f"{q_id}_full.npy")
+                    if os.path.exists(query_feat_path):
+                        try:
+                            q_feat_np = np.load(query_feat_path)
+                            q_feat = torch.from_numpy(q_feat_np).float()
+                            if q_feat.dim() == 3 and q_feat.shape[1] == 9 and q_feat.shape[2] == expected_dims:
+                                feature_cache[query_feat_key] = q_feat
+                            else:
+                                q_feat = None
+                        except:
                             q_feat = None
-                    except:
+                    else:
                         q_feat = None
-                else:
-                    q_feat = None
 
-                if q_feat is None:
-                    q_frames_info = get_sorted_frames_from_dir(query_full_dir)
-                    if q_frames_info is None:
-                        pbar.update(1)
-                        continue
-                    q_imgs = [img for _, img in q_frames_info]
-                    # 分批提取特征（内部已包含 224 缩放）
-                    q_feat = _extract_features_from_list(
-                        model, q_imgs, f"{q_id}_full", args.dense_features_dir,
-                        device, args.batch_sz, expected_dims
-                    )
                     if q_feat is None:
-                        pbar.update(1)
-                        continue
-                    feature_cache[query_feat_key] = q_feat
-
-            # 加载数据库区间合并特征
-            db_feat_key = f"db_{db_id}_" + "_".join(sorted([meta['db_save_dir'] for meta in intervals_list]))
-            if db_feat_key in feature_cache:
-                db_feat = feature_cache[db_feat_key]
-            else:
-                db_merged_feat_path = os.path.join(args.dense_features_dir, 'database', db_id, f"{db_id}_merged.npy")
-                if os.path.exists(db_merged_feat_path):
-                    try:
-                        db_feat_np = np.load(db_merged_feat_path)
-                        db_feat = torch.from_numpy(db_feat_np).float()
-                        if db_feat.dim() == 3 and db_feat.shape[1] == 9 and db_feat.shape[2] == expected_dims:
-                            feature_cache[db_feat_key] = db_feat
-                        else:
-                            db_feat = None
-                    except:
-                        db_feat = None
-                else:
-                    db_feat = None
-
-                if db_feat is None:
-                    all_db_frames = []
-                    for meta in intervals_list:
-                        db_dir = meta['db_save_dir']
-                        frames_info = get_sorted_frames_from_dir(db_dir)
-                        if frames_info is None:
+                        q_frames_info = get_sorted_frames_from_dir(query_full_dir)
+                        if q_frames_info is None:
+                            pbar.update(1)
                             continue
-                        all_db_frames.extend(frames_info)
-                    if not all_db_frames:
-                        pbar.update(1)
-                        continue
-                    all_db_frames.sort(key=lambda x: x[0])
-                    unique_db_frames = []
-                    seen = set()
-                    for idx, img in all_db_frames:
-                        if idx not in seen:
-                            seen.add(idx)
-                            unique_db_frames.append((idx, img))
-                    db_imgs = [img for _, img in unique_db_frames]
-                    db_feat = _extract_features_from_list(
-                        model, db_imgs, f"{db_id}_merged", args.dense_features_dir,
-                        device, args.batch_sz, expected_dims
-                    )
+                        q_imgs = [img for _, img in q_frames_info]
+                        # 分批提取特征（内部已包含 224 缩放）
+                        q_feat = _extract_features_from_list(
+                            model, q_imgs, f"{q_id}_full", args.dense_features_dir,
+                            device, args.batch_sz, expected_dims
+                        )
+                        if q_feat is None:
+                            pbar.update(1)
+                            continue
+                        feature_cache[query_feat_key] = q_feat
+
+                # 加载数据库区间合并特征
+                db_feat_key = f"db_{db_id}_" + "_".join(sorted([meta['db_save_dir'] for meta in intervals_list]))
+                if db_feat_key in feature_cache:
+                    db_feat = feature_cache[db_feat_key]
+                else:
+                    db_merged_feat_path = os.path.join(args.dense_features_dir, 'database', db_id, f"{db_id}_merged.npy")
+                    if os.path.exists(db_merged_feat_path):
+                        try:
+                            db_feat_np = np.load(db_merged_feat_path)
+                            db_feat = torch.from_numpy(db_feat_np).float()
+                            if db_feat.dim() == 3 and db_feat.shape[1] == 9 and db_feat.shape[2] == expected_dims:
+                                feature_cache[db_feat_key] = db_feat
+                            else:
+                                db_feat = None
+                        except:
+                            db_feat = None
+                    else:
+                        db_feat = None
+
                     if db_feat is None:
-                        pbar.update(1)
-                        continue
-                    feature_cache[db_feat_key] = db_feat
+                        all_db_frames = []
+                        for meta in intervals_list:
+                            db_dir = meta['db_save_dir']
+                            frames_info = get_sorted_frames_from_dir(db_dir)
+                            if frames_info is None:
+                                continue
+                            all_db_frames.extend(frames_info)
+                        if not all_db_frames:
+                            pbar.update(1)
+                            continue
+                        all_db_frames.sort(key=lambda x: x[0])
+                        unique_db_frames = []
+                        seen = set()
+                        for idx, img in all_db_frames:
+                            if idx not in seen:
+                                seen.add(idx)
+                                unique_db_frames.append((idx, img))
+                        db_imgs = [img for _, img in unique_db_frames]
+                        db_feat = _extract_features_from_list(
+                            model, db_imgs, f"{db_id}_merged", args.dense_features_dir,
+                            device, args.batch_sz, expected_dims
+                        )
+                        if db_feat is None:
+                            pbar.update(1)
+                            continue
+                        feature_cache[db_feat_key] = db_feat
 
-            sim_val = compute_dense_similarity(model, q_feat, db_feat)
+                sim_val = compute_dense_similarity(model, q_feat, db_feat)
 
-            heatmap_path = os.path.join(args.heatmaps_dir, q_id, f"{db_id}_merged.png")
-            matrix_save_path = os.path.join(args.sim_matrices_dense_dir, q_id, f"{db_id}_merged.npy")
-            compute_and_save_heatmap(model, q_feat, db_feat, heatmap_path, matrix_save_path)
+                heatmap_path = os.path.join(args.heatmaps_dir, q_id, f"{db_id}_merged.png")
+                matrix_save_path = os.path.join(args.sim_matrices_dense_dir, q_id, f"{db_id}_merged.npy")
+                compute_and_save_heatmap(model, q_feat, db_feat, heatmap_path, matrix_save_path)
 
-            if q_id not in similarities:
-                similarities[q_id] = {}
-            if db_id not in similarities[q_id] or sim_val > similarities[q_id][db_id]:
-                similarities[q_id][db_id] = sim_val
+                if q_id not in similarities:
+                    similarities[q_id] = {}
+                if db_id not in similarities[q_id] or sim_val > similarities[q_id][db_id]:
+                    similarities[q_id][db_id] = sim_val
 
-            processed_pairs.add((q_id, db_id))
+                processed_pairs.add((q_id, db_id))
 
-            if len(processed_pairs) % 50 == 0:
-                cp_data = {
-                    'similarities': similarities,
-                    'processed_pairs': list(processed_pairs)
-                }
-                with open(stage4_checkpoint, 'w') as f:
-                    json.dump(cp_data, f)
-            pbar.update(1)
+                if len(processed_pairs) % 50 == 0:
+                    cp_data = {
+                        'similarities': similarities,
+                        'processed_pairs': list(processed_pairs)
+                    }
+                    with open(stage4_checkpoint, 'w') as f:
+                        json.dump(cp_data, f)
+                pbar.update(1)
 
-        pbar.close()
+            pbar.close()
 
-        final_sim_file = os.path.join(args.output_dir, f"similarities_{method_suffix}{model_suffix}_th{args.threshold}.json")
-        with open(final_sim_file, 'w') as f:
-            json.dump(similarities, f, separators=(',', ':'))
-        print(f"> 最终相似度保存至: {final_sim_file}")
+            final_sim_file = os.path.join(args.output_dir, f"similarities_{method_suffix}{model_suffix}_th{args.threshold}.json")
+            with open(final_sim_file, 'w') as f:
+                json.dump(similarities, f, separators=(',', ':'))
+            print(f"> 最终相似度保存至: {final_sim_file}")
 
-        if os.path.exists(stage4_checkpoint):
-            os.remove(stage4_checkpoint)
+            # [修改点] 若指定了检测阈值，生成二分类预测结果但不进行评估（评估移至第五阶段）
+            if args.detection_threshold is not None:
+                detection_results = {}
+                for q_id, db_scores in similarities.items():
+                    detection_results[q_id] = {}
+                    for db_id, score in db_scores.items():
+                        detection_results[q_id][db_id] = 1 if score >= args.detection_threshold else 0
+                detection_file = os.path.join(args.output_dir, f"detection_predictions_th{args.detection_threshold}.json")
+                with open(detection_file, 'w') as f:
+                    json.dump(detection_results, f, separators=(',', ':'))
+                print(f"> 二分类预测结果已保存至: {detection_file}")
 
-        stage4_time = time.time() - stage4_start
+            if os.path.exists(stage4_checkpoint):
+                os.remove(stage4_checkpoint)
+
+            stage4_time = time.time() - stage4_start
+            print(f"> 第四阶段完成，耗时 {stage4_time:.2f}s")
+
         total_time = time.time() - total_start
 
-        # 评估
-        print("\n" + "=" * 60)
-        print("评估")
-        print("=" * 60)
-        try:
-            if 'FIVR' in args.dataset:
-                from datasets import FIVR
-                version = args.dataset.split('-')[1].lower() if '-' in args.dataset else '5k'
-                dataset = FIVR(version=version)
-            elif args.dataset == 'VCDB':
-                from datasets import VCDB
-                vcdb_root = "datasets/VCDB/core_dataset"
-                dataset = VCDB(root_dir=vcdb_root, pickle_path=os.path.join(vcdb_root, 'vcdb_cleaned.pickle'))
-            else:
-                raise ValueError(f"未知数据集: {args.dataset}")
-            eval_results = dataset.evaluate(similarities)
-            eval_file = os.path.join(args.output_dir, f"evaluation_{method_suffix}{model_suffix}_th{args.threshold}.json")
-            with open(eval_file, 'w') as f:
-                json.dump(eval_results, f, indent=2)
-            if args.dataset == 'VCDB':
-                print(f"> mAP: {eval_results.get('mAP', 0):.4f}")
-            else:
-                print(f"> DSVR: {eval_results.get('DSVR', 0):.4f}")
-                print(f"> CSVR: {eval_results.get('CSVR', 0):.4f}")
-                print(f"> ISVR: {eval_results.get('ISVR', 0):.4f}")
-        except Exception as e:
-            print(f"> 评估失败: {e}")
+        # 评估 mAP (仅当运行了阶段4或all时)
+        if args.stage in ['4', 'all'] and similarities:
+            print("\n" + "=" * 60)
+            print("检索排序评估 (mAP)")
+            print("=" * 60)
+            try:
+                if 'FIVR' in args.dataset:
+                    from datasets import FIVR
+                    version = args.dataset.split('-')[1].lower() if '-' in args.dataset else '5k'
+                    dataset = FIVR(version=version)
+                elif args.dataset == 'VCDB':
+                    from datasets import VCDB
+                    vcdb_root = "datasets/VCDB/core_dataset"
+                    dataset = VCDB(root_dir=vcdb_root, pickle_path=os.path.join(vcdb_root, 'vcdb_cleaned.pickle'))
+                else:
+                    raise ValueError(f"未知数据集: {args.dataset}")
+                eval_results = dataset.evaluate(similarities)
+                eval_file = os.path.join(args.output_dir, f"evaluation_{method_suffix}{model_suffix}_th{args.threshold}.json")
+                with open(eval_file, 'w') as f:
+                    json.dump(eval_results, f, indent=2)
+                if args.dataset == 'VCDB':
+                    print(f"> mAP: {eval_results.get('mAP', 0):.4f}")
+                else:
+                    print(f"> DSVR: {eval_results.get('DSVR', 0):.4f}")
+                    print(f"> CSVR: {eval_results.get('CSVR', 0):.4f}")
+                    print(f"> ISVR: {eval_results.get('ISVR', 0):.4f}")
+            except Exception as e:
+                print(f"> 评估失败: {e}")
 
-        summary = {
-            'dataset': args.dataset,
-            'first_stage_method': args.first_stage_method,
-            'threshold': args.threshold,
-            'dense_fps': args.dense_fps,
-            'stage1_time': stage1_time,
-            'stage2_time': stage2_time,
-            'stage3_time': stage3_time,
-            'stage4_time': stage4_time,
-            'total_time': total_time,
-            'device': 'GPU' if not args.cpu_only and torch.cuda.is_available() else 'CPU'
-        }
-        summary_file = os.path.join(args.output_dir, f"summary_{method_suffix}{model_suffix}_th{args.threshold}.json")
-        with open(summary_file, 'w') as f:
-            json.dump(summary, f, indent=2)
-        print(f"> 总结保存: {summary_file}")
+            summary = {
+                'dataset': args.dataset,
+                'first_stage_method': args.first_stage_method,
+                'threshold': args.threshold,
+                'dense_fps': args.dense_fps,
+                'stage1_time': stage1_time,
+                'stage2_time': stage2_time,
+                'stage3_time': stage3_time,
+                'stage4_time': stage4_time,
+                'total_time': total_time,
+                'device': 'GPU' if not args.cpu_only and torch.cuda.is_available() else 'CPU'
+            }
+            summary_file = os.path.join(args.output_dir, f"summary_{method_suffix}{model_suffix}_th{args.threshold}.json")
+            with open(summary_file, 'w') as f:
+                json.dump(summary, f, indent=2)
+            print(f"> 总结保存: {summary_file}")
+
+    # [修改点] 第五阶段：独立二分类评估，包含缺失分数补全与Platt Scaling校准
+    if args.stage in ['5', 'all']:
         print("\n" + "=" * 60)
-        print("完成")
+        print("第五阶段：二分类检测评估（含缺失补全与概率校准）")
+        print("=" * 60)
+        stage5_start = time.time()
+
+        # 加载相似度分数文件
+        sim_file = os.path.join(args.output_dir, f"similarities_{method_suffix}{model_suffix}_th{args.threshold}.json")
+        if not os.path.exists(sim_file):
+            print(f"> 错误: 相似度文件不存在 {sim_file}")
+            return
+        with open(sim_file, 'r') as f:
+            similarities = json.load(f)
+
+        # [修改点] 补全缺失视频对分数为 -1.0
+        print("> 补全缺失视频对相似度分数 (-1.0)...")
+        for q_id in query_ids:
+            if q_id not in similarities:
+                similarities[q_id] = {}
+            for db_id in database_ids:
+                if db_id not in similarities[q_id]:
+                    similarities[q_id][db_id] = -1.0
+
+        # 构建真实标签
+        print("> 构建真实标签...")
+        y_true, raw_scores = [], []
+        if args.dataset == 'VCDB':
+            positive_set = {}
+            for q_id in query_ids:
+                core_video = vcdb.query_to_core.get(q_id)
+                if core_video is None:
+                    continue
+                copies = vcdb.core_to_copies.get(core_video, [])
+                positive_set[q_id] = {os.path.splitext(v)[0] for v in copies}
+            for q_id in query_ids:
+                for db_id in database_ids:
+                    true_label = 1 if (q_id in positive_set and db_id in positive_set[q_id]) else 0
+                    score = similarities[q_id][db_id]
+                    y_true.append(true_label)
+                    raw_scores.append(score)
+        elif 'FIVR' in args.dataset:
+            from datasets import FIVR
+            version = args.dataset.split('-')[1].lower() if '-' in args.dataset else '5k'
+            fivr_dataset = FIVR(version=version)
+            positive_set = {}
+            for q_id in query_ids:
+                relevant_dict = fivr_dataset.annotation.get(q_id, {})
+                pos_list = sum([relevant_dict.get(label, []) for label in ['ND', 'DS']], [])
+                positive_set[q_id] = set(pos_list)
+            for q_id in query_ids:
+                for db_id in database_ids:
+                    true_label = 1 if db_id in positive_set.get(q_id, set()) else 0
+                    score = similarities[q_id][db_id]
+                    y_true.append(true_label)
+                    raw_scores.append(score)
+        else:
+            print(f"> 警告: 数据集 {args.dataset} 暂不支持二分类评估")
+            return
+
+        y_true = np.array(y_true)
+        raw_scores = np.array(raw_scores)
+
+        # [修改点] Platt Scaling 概率校准 (使用逻辑回归)
+        print("> 训练 Platt Scaling 校准器 (逻辑回归)...")
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.model_selection import train_test_split
+
+        # 划分训练/测试集用于校准器训练与评估 (80%训练校准器，20%测试)
+        X = raw_scores.reshape(-1, 1)
+        y = y_true
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+        # 训练 Platt Scaling (逻辑回归)
+        calib = LogisticRegression(penalty='l2', C=1.0, solver='lbfgs', max_iter=1000)
+        calib.fit(X_train, y_train)
+
+        # 对全量数据进行概率预测
+        proba = calib.predict_proba(X)[:, 1]  # 正类概率
+
+        # [修改点] 使用校准概率进行二分类决策 (默认阈值0.5)
+        pred_labels = (proba >= args.detection_threshold).astype(int)
+
+        # 计算指标
+        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+        acc = accuracy_score(y_true, pred_labels)
+        prec = precision_score(y_true, pred_labels, zero_division=0)
+        rec = recall_score(y_true, pred_labels, zero_division=0)
+        f1 = f1_score(y_true, pred_labels, zero_division=0)
+        cm = confusion_matrix(y_true, pred_labels)
+
+        print("\n" + "=" * 50)
+        print(f"二分类检测评估 (Platt校准后, 决策阈值={args.detection_threshold})")
+        print(f"总样本数: {len(y_true)}")
+        print(f"正样本数: {np.sum(y_true)}")
+        print("-" * 30)
+        print(f"准确率 (Accuracy):  {acc:.4f}")
+        print(f"精确率 (Precision): {prec:.4f}")
+        print(f"召回率 (Recall):    {rec:.4f}")
+        print(f"F1 分数:           {f1:.4f}")
+        print("-" * 30)
+        print("混淆矩阵:")
+        print(f"           预测负类  预测正类")
+        print(f"真实负类:  {cm[0,0]:6d}    {cm[0,1]:6d}")
+        print(f"真实正类:  {cm[1,0]:6d}    {cm[1,1]:6d}")
+        print("=" * 50)
+
+        # 保存校准器与评估结果
+        import joblib
+        calib_file = os.path.join(args.output_dir, f"platt_calibrator_{method_suffix}{model_suffix}_th{args.threshold}.pkl")
+        joblib.dump(calib, calib_file)
+        print(f"> Platt校准器已保存至: {calib_file}")
+
+        metrics_file = os.path.join(args.output_dir, f"detection_metrics_calibrated_{method_suffix}{model_suffix}_th{args.threshold}.json")
+        with open(metrics_file, 'w') as f:
+            json.dump({
+                'threshold': 0.5,
+                'accuracy': acc, 'precision': prec, 'recall': rec, 'f1': f1,
+                'confusion_matrix': cm.tolist()
+            }, f, indent=2)
+        print(f"> 评估指标已保存至: {metrics_file}")
+
+        stage5_time = time.time() - stage5_start
+        print(f"> 第五阶段完成，耗时 {stage5_time:.2f}s")
+
+    if args.stage == 'all':
+        print("\n" + "=" * 60)
+        print("全部阶段完成")
         print("=" * 60)
 
 
