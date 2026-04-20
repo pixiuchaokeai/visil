@@ -423,100 +423,46 @@ class SVD(object):
             print('mAP: {:.4f}'.format(np.mean(mAP)))
         return {'mAP': np.mean(mAP)}
 
+# ... 前面的 FIVR, EVVE, SVD 等类保持不变 ...
+# ... 其他类（FIVR, EVVE, SVD）保持不变 ...
 
-# [修改点] 新增 VCDB 数据集类，基于原始标注文件动态构建
 class VCDB(object):
-    def __init__(self, root_dir='datasets/VCDB/core_dataset', pickle_path='datasets/vcdb.pickle'):
+    """
+    VCDB 拷贝检测数据集类
+    基于 query_to_database 定义查询视频及其正样本数据库视频。
+    """
+    def __init__(self, root_dir='datasets/VCDB/core_dataset', pickle_path='datasets/VCDB/core_dataset/vcdb_cleaned.pickle'):
         self.name = 'VCDB'
         self.root_dir = root_dir
         self.pickle_path = pickle_path
 
-        # 检查 pickle 是否存在且包含必要字段
-        need_rebuild = True
-        if os.path.exists(pickle_path):
-            with open(pickle_path, 'rb') as f:
-                data = pk.load(f)
-            if 'query_to_core' in data and 'core_to_copies' in data:
-                self.queries = data['queries']
-                self.database = data['database']
-                self.query_to_core = data['query_to_core']
-                self.core_to_copies = data['core_to_copies']
-                need_rebuild = False
-                print(f"> VCDB 数据集已从 {pickle_path} 加载")
-            else:
-                print("> 检测到旧版 pickle，将重新解析标注文件...")
+        if not os.path.exists(pickle_path):
+            raise FileNotFoundError(f"VCDB pickle 文件不存在: {pickle_path}")
 
-        if need_rebuild:
-            print("> 开始解析 VCDB 标注文件...")
-            self.queries, self.database, self.query_to_core, self.core_to_copies = self._build_from_annotations()
-            os.makedirs(os.path.dirname(pickle_path), exist_ok=True)
-            with open(pickle_path, 'wb') as f:
-                pk.dump({
-                    'queries': self.queries,
-                    'database': self.database,
-                    'query_to_core': self.query_to_core,
-                    'core_to_copies': self.core_to_copies
-                }, f)
-            print(f"> 数据集结构已保存至 {pickle_path}")
+        with open(pickle_path, 'rb') as f:
+            data = pk.load(f)
 
-    def _build_from_annotations(self):
-        ann_dir = os.path.join(self.root_dir, 'annotation')
-        if not os.path.isdir(ann_dir):
-            raise FileNotFoundError(f"标注目录不存在: {ann_dir}")
+        # [修改点] 强制要求 query_to_database 字段
+        if 'query_to_database' not in data:
+            raise KeyError("VCDB pickle 文件缺少 'query_to_database' 字段")
 
-        query_names = []
-        all_videos = set()
-        query_to_core = {}
-        core_to_copies = {}
+        self.query_to_database = data['query_to_database']
 
-        txt_files = glob.glob(os.path.join(ann_dir, '*.txt'))
-        for txt_file in txt_files:
-            event_name = os.path.splitext(os.path.basename(txt_file))[0]
-            query_names.append(event_name)
+        # 查询集 = query_to_database 的所有键（视频ID）
+        self.queries = list(self.query_to_database.keys())
 
-            core_video = None
-            copies = set()
+        # 数据库集 = 所有出现在 query_to_database 值中的视频 + 查询视频本身（去重）
+        db_set = set()
+        for vlist in self.query_to_database.values():
+            db_set.update(vlist)
+        db_set.update(self.queries)
+        self.database = list(db_set)
 
-            with open(txt_file, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    parts = line.split(',')
-                    if len(parts) != 6:
-                        continue
-                    videoA = parts[0].strip()
-                    videoB = parts[1].strip()
-                    all_videos.add(videoA)
-                    all_videos.add(videoB)
+        # 场景信息保留但不用于拷贝检测评估
+        self.scenes = data.get('scene', [])
+        self.scene_to_videos = data.get('scene_to_videos', {})
 
-                    if core_video is None:
-                        # 通常核心视频文件名与事件名相同
-                        if event_name in videoA:
-                            core_video = videoA
-                            copies.add(videoB)
-                        elif event_name in videoB:
-                            core_video = videoB
-                            copies.add(videoA)
-                        else:
-                            core_video = videoA
-                            copies.add(videoB)
-                    else:
-                        if videoA == core_video:
-                            copies.add(videoB)
-                        elif videoB == core_video:
-                            copies.add(videoA)
-                        else:
-                            copies.add(videoA)
-                            copies.add(videoB)
-
-            if core_video is None:
-                continue
-            query_to_core[event_name] = core_video
-            core_to_copies[core_video] = list(copies)
-
-        database_list = list(all_videos)
-        return query_names, database_list, query_to_core, core_to_copies
+        print(f"> VCDB 数据集加载完成: {len(self.queries)} 查询视频, {len(self.database)} 数据库视频")
 
     def get_queries(self):
         return self.queries
@@ -524,62 +470,59 @@ class VCDB(object):
     def get_database(self):
         return self.database
 
-    # [修改点] 修正 AP 计算，使正样本 ID 与检索结果中的 ID 格式一致（均使用无扩展名的纯文件名）
-    def calculate_mAP(self, query, res, all_db):
-        core_video = self.query_to_core.get(query)
-        if core_video is None:
-            return 0.0
-        positive_set = set(self.core_to_copies.get(core_video, []))
-        # 将正样本视频文件名转换为纯 ID（去掉扩展名）
-        positive_ids = {os.path.splitext(v)[0] for v in positive_set}
-        # 同时将 all_db 也转换为纯 ID 集合（若传入的是带扩展名的）
-        all_db_ids = {os.path.splitext(v)[0] for v in all_db} if all_db else set()
-        positive_ids = positive_ids.intersection(all_db_ids)
-
-        if len(positive_ids) == 0:
-            return 0.0
-
-        sorted_videos = sorted(res.keys(), key=lambda x: res[x], reverse=True)
-        i, ri, s = 0.0, 0, 0.0
-        core_id = os.path.splitext(core_video)[0]
-        for video in sorted_videos:
-            # res 中的 key 已是纯 ID
-            if video == core_id:
-                continue
-            if video in all_db_ids:
-                ri += 1
-                if video in positive_ids:
-                    i += 1.0
-                    s += i / ri
-
-        return s / len(positive_ids)
-
-    # [修改点] evaluate 中将 all_db 预先转换为纯 ID 集合传入
+    # [修改点] evaluate 方法基于 query_to_database 计算 mAP
     def evaluate(self, similarities, all_db=None, verbose=True):
+        """
+        评估检索性能，计算 mAP
+        参数:
+            similarities: dict {query_video_id: {db_video_id: score}}
+            all_db: 实际检索的数据库视频集合，默认为全部数据库视频
+            verbose: 是否打印详细信息
+        返回:
+            dict: {'mAP': mAP}
+        """
         if all_db is None:
             all_db = set(self.database)
-        # 将数据库列表转换为纯 ID 集合（因为 similarities 中的 key 是纯 ID）
-        all_db_ids = {os.path.splitext(v)[0] for v in all_db}
+        else:
+            all_db = set(all_db)
 
-        mAP_list = []
-        not_found = 0
+        aps = []
+        missing_queries = 0
 
         for query in self.queries:
             if query not in similarities:
-                not_found += 1
+                missing_queries += 1
                 continue
-            ap = self.calculate_mAP(query, similarities[query], all_db_ids)
-            mAP_list.append(ap)
+            res = similarities[query]
+            pos_videos = set(self.query_to_database.get(query, []))
+            pos_videos = pos_videos.intersection(all_db)
+            if len(pos_videos) == 0:
+                continue
+
+            # 按分数降序排序
+            sorted_videos = sorted(res.keys(), key=lambda x: res[x], reverse=True)
+            i = 0.0   # 当前找到的相关视频数
+            ri = 0.0  # 当前排名
+            s = 0.0   # precision 累加和
+            for video in sorted_videos:
+                if video not in all_db:
+                    continue
+                ri += 1
+                if video in pos_videos:
+                    i += 1.0
+                    s += i / ri
+            ap = s / len(pos_videos)
+            aps.append(ap)
+
+        mAP = np.mean(aps) if aps else 0.0
 
         if verbose:
             print('=' * 5, 'VCDB Dataset', '=' * 5)
-            if not_found > 0:
-                print(f'[WARNING] {not_found} queries missing from results')
-            print(f'Queries evaluated: {len(mAP_list)}')
-            print(f'Database: {len(all_db_ids)} videos')
+            if missing_queries > 0:
+                print(f'[WARNING] {missing_queries} 个查询在结果中缺失，已忽略')
+            print(f'评估查询数: {len(aps)}')
+            print(f'数据库视频数: {len(all_db)}')
             print('-' * 16)
-            print(f'mAP: {np.mean(mAP_list):.4f}')
+            print(f'mAP: {mAP:.4f}')
 
-        return {'mAP': np.mean(mAP_list)}
-
-
+        return {'mAP': mAP}

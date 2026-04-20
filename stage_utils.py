@@ -578,7 +578,57 @@ def load_dense_frames_from_dir(frame_dir):
     return frames_tensor.permute(0, 2, 3, 1)
 
 
+# stage_utils.py (完整文件中仅修改此函数)
+# [修改点] 新增：流式读取帧，避免内存溢出
+def get_sorted_frames_generator(frame_dir):
+    """
+    流式读取目录下的 frame_*.jpg 文件，按帧索引排序后逐个 yield。
+    返回生成器，每次 yield (frame_idx, img_np)。
+    若目录无有效帧，返回 None。
+    """
+    import glob
+    jpg_files = sorted(glob.glob(os.path.join(frame_dir, "frame_*.jpg")))
+    if not jpg_files:
+        return None
+
+    # 先收集所有 (idx, path) 对并排序
+    frame_items = []
+    for f in jpg_files:
+        base = os.path.basename(f)
+        idx_str = base.replace('frame_', '').replace('.jpg', '')
+        try:
+            frame_idx = int(idx_str)
+            frame_items.append((frame_idx, f))
+        except ValueError:
+            continue
+    if not frame_items:
+        return None
+    frame_items.sort(key=lambda x: x[0])
+
+    def generator():
+        for idx, path in frame_items:
+            try:
+                img = Image.open(path).convert('RGB')
+                img_np = np.array(img)
+                yield idx, img_np
+            except Exception:
+                continue
+
+    return generator()
+
+
+def get_sorted_frames_count(frame_dir):
+    """返回目录下有效帧的数量，不加载图像数据"""
+    import glob
+    jpg_files = glob.glob(os.path.join(frame_dir, "frame_*.jpg"))
+    return len(jpg_files)
+
+
+# [修改点] 原 get_sorted_frames_from_dir 保留但标记为可能内存危险，建议使用生成器版本
 def get_sorted_frames_from_dir(frame_dir):
+    """
+    注意：此函数可能因帧数过多导致内存溢出，建议使用 get_sorted_frames_generator。
+    """
     import glob
     jpg_files = sorted(glob.glob(os.path.join(frame_dir, "frame_*.jpg")))
     if not jpg_files:

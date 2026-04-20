@@ -38,12 +38,14 @@ from stage_utils import (
     merge_db_intervals,
     load_dense_frames_from_dir,
     get_sorted_frames_from_dir,
+    get_sorted_frames_generator,
+    get_sorted_frames_count,
     extract_full_dense_frames
 )
 from datasets.generators import VideoGenerator
 
 
-# [修改点] 数据集预设配置 - 修正 VCDB 的 database_file 路径，使用清洗后的文件
+# 数据集预设配置
 DATASET_PRESETS = {
     "FIVR-5K": {
         "video_dir": "datasets/FIVR-200K",
@@ -86,7 +88,7 @@ DATASET_PRESETS = {
 
 def main():
     parser = argparse.ArgumentParser(description='四阶段视频相似度评估')
-    parser.add_argument('--dataset', type=str, default="FIVR-5K",
+    parser.add_argument('--dataset', type=str, default="VCDB",
                         choices=list(DATASET_PRESETS.keys()),
                         help='评估数据集名称')
     parser.add_argument('--video_dir', type=str, default=None)
@@ -95,8 +97,11 @@ def main():
     parser.add_argument('--database_file', type=str, default=None)
     parser.add_argument('--first_stage_method', type=str, default='iframe',
                         choices=['default', '2s', 'local_maxima', 'iframe', 'i_p_mixed'])
-    parser.add_argument('--threshold', type=float, default=0.1)
-    # [修改点] 二分类检测阈值参数
+    parser.add_argument('--threshold', type=float, default=-0.4,
+                        help='第二阶段相似度矩阵筛选阈值')
+    parser.add_argument('--sim_type', type=str, default='chamfer',
+                        choices=['cos', 'chamfer'],
+                        help='第二阶段相似度矩阵计算方式: cos(余弦相似度), chamfer(帧级Chamfer相似度)')
     parser.add_argument('--detection_threshold', type=float, default=0.1,
                         help='若提供，将在阶段四后输出二分类检测结果并计算评估指标')
     parser.add_argument('--max_keyframes', type=int, default=0)
@@ -111,7 +116,6 @@ def main():
     parser.add_argument('--features_dir', type=str, default='features1')
     parser.add_argument('--output_dir', type=str, default='output')
     parser.add_argument('--ffprobe_path', type=str, default='ffprobe')
-    # [修改点] 增加第五阶段选项
     parser.add_argument('--stage', type=str, default='all',
                         choices=['1', '2', '3', '4', '5', 'all'])
     parser.add_argument('--sim_matrices_dir', type=str, default=None)
@@ -121,7 +125,6 @@ def main():
     parser.add_argument('--dense_features_dir', type=str, default=None)
     parser.add_argument('--sim_matrices_dense_dir', type=str, default=None)
     parser.add_argument('--only_first_stage', action='store_true', default=False)
-
 
     args = parser.parse_args()
 
@@ -163,20 +166,36 @@ def main():
     os.makedirs(actual_frames_dir, exist_ok=True)
     os.makedirs(actual_features_dir, exist_ok=True)
 
-    if args.sim_matrices_dir is None:
-        args.sim_matrices_dir = os.path.join(args.output_dir, 'sim_matrices_cos_rough', method_suffix + model_suffix)
-    if args.dense_frames_dir is None:
-        args.dense_frames_dir = os.path.join(args.output_dir, 'dense_frames', f"{method_suffix}{model_suffix}_dense_{args.dense_fps}fps")
-    if args.intervals_meta is None:
-        args.intervals_meta = os.path.join(args.dense_frames_dir, 'intervals_meta.json')
-    if args.heatmaps_dir is None:
-        args.heatmaps_dir = os.path.join(args.output_dir, 'heatmaps', method_suffix + model_suffix)
-    if args.dense_features_dir is None:
-        args.dense_features_dir = os.path.join(args.output_dir, 'dense_features', f"{method_suffix}{model_suffix}_dense_{args.dense_fps}fps")
-    if args.sim_matrices_dense_dir is None:
-        args.sim_matrices_dense_dir = os.path.join(args.output_dir, 'sim_matrices_chamfer_dense', method_suffix + model_suffix)
+    sim_type_str = args.sim_type
+    threshold_str = f"th{args.threshold}".replace('.', 'p').replace('-', 'm')
+    threshold_str_dir = f"{method_suffix}{model_suffix}_{threshold_str}"
 
-    for d in [args.sim_matrices_dir, args.dense_frames_dir, args.heatmaps_dir, args.dense_features_dir, args.sim_matrices_dense_dir]:
+    # [修改点] 第二阶段矩阵目录简化：直接放在方法+模型目录下，无子目录
+    if args.sim_matrices_dir is None:
+        args.sim_matrices_dir = os.path.join(args.output_dir, f'sim_matrices_{sim_type_str}_rough', method_suffix + model_suffix)
+    # [修改点] 密集帧目录结构
+    if args.dense_frames_dir is None:
+        args.dense_frames_dir = os.path.join(args.output_dir, 'dense_frames')
+    # intervals_meta 放在 dense_frames 根目录下
+    if args.intervals_meta is None:
+        args.intervals_meta = os.path.join(args.dense_frames_dir, f'intervals_meta_{threshold_str_dir}.json')
+    if args.heatmaps_dir is None:
+        args.heatmaps_dir = os.path.join(args.output_dir, 'heatmaps', threshold_str_dir)
+    if args.dense_features_dir is None:
+        args.dense_features_dir = os.path.join(args.output_dir, 'dense_features')
+    if args.sim_matrices_dense_dir is None:
+        args.sim_matrices_dense_dir = os.path.join(args.output_dir, 'sim_matrices_chamfer_dense', threshold_str_dir)
+
+    # [修改点] 创建必要的子目录结构
+    dense_frames_queries_dir = os.path.join(args.dense_frames_dir, 'queries')
+    dense_frames_db_threshold_dir = os.path.join(args.dense_frames_dir, f'database_{threshold_str_dir}')
+    dense_features_queries_dir = os.path.join(args.dense_features_dir, 'queries')
+    dense_features_db_threshold_dir = os.path.join(args.dense_features_dir, f'database_{threshold_str_dir}')
+
+    for d in [args.sim_matrices_dir, args.dense_frames_dir, args.heatmaps_dir,
+              args.dense_features_dir, args.sim_matrices_dense_dir,
+              dense_frames_queries_dir, dense_frames_db_threshold_dir,
+              dense_features_queries_dir, dense_features_db_threshold_dir]:
         os.makedirs(d, exist_ok=True)
 
     if args.cpu_only or not torch.cuda.is_available():
@@ -193,13 +212,13 @@ def main():
     query_ids = []
     database_ids = []
 
-    # [修改点] 构建列表 (VCDB 直接使用清洗后的文本文件，不再依赖 VCDB 类的 get_queries/get_database)
+    # VCDB特殊处理：读取清洗后的查询/数据库文件，并建立事件名到核心视频ID的映射
+    vcdb_core_map = {}
     if args.dataset == 'VCDB':
-        # 评估阶段仍需要 VCDB 类提供 ground truth，但使用清洗后的 pickle
         from datasets import VCDB
         vcdb_root = "datasets/VCDB/core_dataset"
         vcdb = VCDB(root_dir=vcdb_root, pickle_path=os.path.join(vcdb_root, 'vcdb_cleaned.pickle'))
-        print(f"> 构建 VCDB 查询/数据库列表 (使用清洗后文件)...")
+        print(f"> VCDB 数据集加载成功")
 
         if args.query_file and os.path.exists(args.query_file):
             with open(args.query_file, 'r') as f:
@@ -209,10 +228,13 @@ def main():
                         continue
                     parts = line.split()
                     if len(parts) >= 2:
-                        query_id = parts[0]          # 事件名
+                        query_id = parts[0]
                         video_path = ' '.join(parts[1:])
                         id_to_path[query_id] = video_path
                         query_ids.append(query_id)
+                        core_video = vcdb.query_to_core.get(query_id)
+                        if core_video:
+                            vcdb_core_map[query_id] = core_video
             print(f"> 查询数: {len(query_ids)} (事件名)")
         else:
             print(f"> 错误: 查询文件不存在 {args.query_file}")
@@ -286,16 +308,83 @@ def main():
                             break
                 id_to_path[vid] = path_candidate
 
-    # [修改点] 分批特征提取函数，加入 224x224 缩放，并检查缓存
-    def _extract_features_from_list(model, frames_list, video_id, features_dir, device, batch_size, expected_dims):
-        """
-        frames_list: list of numpy array (H, W, 3) uint8, RGB
-        返回: Tensor [T, 9, D] 或 None
-        """
+    # [修改点] 流式特征提取函数
+    def _extract_features_from_generator(model, frame_generator, total_frames, video_id, features_dir, device,
+                                         batch_size, expected_dims):
         feat_path = os.path.join(features_dir, video_id, f"{video_id}.npy")
         os.makedirs(os.path.dirname(feat_path), exist_ok=True)
 
-        # 检查已有有效缓存
+        if os.path.exists(feat_path):
+            try:
+                feat_np = np.load(feat_path)
+                feat = torch.from_numpy(feat_np).float()
+                if feat.dim() == 3 and feat.shape[1] == 9 and feat.shape[2] == expected_dims:
+                    return feat
+            except:
+                pass
+
+        if total_frames == 0:
+            return None
+
+        try:
+            import psutil
+            def get_safe_batch_size(desired_bs):
+                mem = psutil.virtual_memory()
+                if mem.available < 2 * 1024 ** 3:
+                    return max(1, desired_bs // 2)
+                return desired_bs
+        except ImportError:
+            def get_safe_batch_size(desired_bs):
+                return desired_bs
+
+        features_list = []
+        batch_frames = []
+        model.eval()
+
+        current_bs = get_safe_batch_size(batch_size)
+        processed = 0
+
+        with torch.no_grad():
+            for idx, img in frame_generator:
+                if img.shape[0] != 224 or img.shape[1] != 224:
+                    img = cv2.resize(img, (224, 224), interpolation=cv2.INTER_LINEAR)
+                batch_frames.append(img)
+
+                if len(batch_frames) >= current_bs:
+                    batch_np = np.stack(batch_frames, axis=0)
+                    batch_tensor = torch.from_numpy(batch_np).float().to(device)
+                    batch_feat = model.extract_features(batch_tensor)
+                    features_list.append(batch_feat.cpu())
+                    processed += len(batch_frames)
+                    del batch_tensor, batch_feat, batch_np
+                    batch_frames.clear()
+                    gc.collect()
+                    if device.type == 'cuda':
+                        torch.cuda.empty_cache()
+                    current_bs = get_safe_batch_size(batch_size)
+
+            if batch_frames:
+                batch_np = np.stack(batch_frames, axis=0)
+                batch_tensor = torch.from_numpy(batch_np).float().to(device)
+                batch_feat = model.extract_features(batch_tensor)
+                features_list.append(batch_feat.cpu())
+                del batch_tensor, batch_feat, batch_np
+                batch_frames.clear()
+
+        if not features_list:
+            return None
+
+        features = torch.cat(features_list, dim=0)
+        if features.shape[1] != 9 or features.shape[2] != expected_dims:
+            return None
+
+        np.save(feat_path, features.cpu().numpy())
+        return features
+
+    def _extract_features_from_list(model, frames_list, video_id, features_dir, device, batch_size, expected_dims):
+        feat_path = os.path.join(features_dir, video_id, f"{video_id}.npy")
+        os.makedirs(os.path.dirname(feat_path), exist_ok=True)
+
         if os.path.exists(feat_path):
             try:
                 feat_np = np.load(feat_path)
@@ -308,7 +397,6 @@ def main():
         if not frames_list:
             return None
 
-        # [修改点] 将所有帧缩放至 224x224
         resized_frames = []
         for img in frames_list:
             if img.shape[0] != 224 or img.shape[1] != 224:
@@ -323,9 +411,9 @@ def main():
         with torch.no_grad():
             for i in range(0, total_frames, batch_size):
                 end = min(i + batch_size, total_frames)
-                batch_frames_np = np.stack(frames_list[i:end], axis=0)  # [B, H, W, 3] uint8
-                batch_tensor = torch.from_numpy(batch_frames_np).float().to(device)  # [B, H, W, 3] float
-                batch_feat = model.extract_features(batch_tensor)  # [B, 9, D]
+                batch_frames_np = np.stack(frames_list[i:end], axis=0)
+                batch_tensor = torch.from_numpy(batch_frames_np).float().to(device)
+                batch_feat = model.extract_features(batch_tensor)
                 features_list.append(batch_feat.cpu())
                 del batch_tensor, batch_feat
                 if device.type == 'cpu':
@@ -334,14 +422,14 @@ def main():
         if not features_list:
             return None
 
-        features = torch.cat(features_list, dim=0)  # [T, 9, D]
+        features = torch.cat(features_list, dim=0)
         if features.shape[1] != 9 or features.shape[2] != expected_dims:
             return None
 
         np.save(feat_path, features.cpu().numpy())
         return features
 
-    # [修改点] 阶段1：流式处理，严格检查缓存，明确区分帧提取和特征提取子阶段
+    # 阶段1
     def run_stage1(model, device):
         print("\n" + "=" * 60)
         print("第一阶段：关键帧提取与特征计算")
@@ -355,7 +443,6 @@ def main():
         fail_log.write("=" * 80 + "\n")
 
         def check_frames_exist(video_id):
-            """检查帧缓存是否完整（indices.json 及所有对应 jpg 均存在）"""
             sub_dir = os.path.join(actual_frames_dir, video_id)
             indices_path = os.path.join(sub_dir, 'indices.json')
             if not os.path.isfile(indices_path):
@@ -372,7 +459,6 @@ def main():
                 return False
 
         def load_frames_from_disk(video_id):
-            """从已保存的 JPG 加载帧，返回 (indices, frames_np_list)"""
             sub_dir = os.path.join(actual_frames_dir, video_id)
             with open(os.path.join(sub_dir, 'indices.json'), 'r') as f:
                 indices = json.load(f)
@@ -387,7 +473,6 @@ def main():
             return indices, frames
 
         def feature_exists(video_id):
-            """检查特征文件是否存在且维度正确"""
             feat_path = os.path.join(actual_features_dir, video_id, f"{video_id}.npy")
             if not os.path.exists(feat_path):
                 return False
@@ -400,21 +485,18 @@ def main():
                 pass
             return False
 
-        # [修改点] 处理单个视频的辅助函数：帧提取（如需要）+ 特征提取（如需要）
         def process_video(video_id, video_type):
             video_path = id_to_path.get(video_id)
             if not video_path or not os.path.exists(video_path):
                 fail_log.write(f"[{video_type}] {video_id}: 视频文件不存在或路径无效 ({video_path})\n")
-                return False, False  # (frame_success, feat_success)
+                return False, False
 
             frames_ready = False
             feat_ready = False
 
-            # 先检查特征缓存，若已存在则直接成功
             if feature_exists(video_id):
                 return True, True
 
-            # 否则需要帧数据
             frames_np_list = None
             try:
                 if check_frames_exist(video_id):
@@ -422,7 +504,6 @@ def main():
                     if indices is not None and frames_np_list is not None:
                         frames_ready = True
                 else:
-                    # 抽取关键帧
                     with open(os.devnull, 'w') as devnull:
                         with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
                             indices, frames_np_list, _, _ = extract_keyframes(
@@ -436,7 +517,6 @@ def main():
                         return False, False
 
                 if frames_ready:
-                    # 提取特征
                     feat = _extract_features_from_list(
                         model, frames_np_list, video_id, actual_features_dir, device,
                         args.batch_sz, expected_dims
@@ -453,9 +533,7 @@ def main():
                 del frames_np_list
                 gc.collect()
 
-        # [修改点] 子阶段1：帧提取/加载（若缓存不存在）
         print("\n[子阶段1] 帧提取/加载...")
-        # 第一轮：确保所有视频的帧缓存存在
         need_frame_db = []
         need_frame_query = []
         for db_id in database_ids:
@@ -467,7 +545,6 @@ def main():
 
         if need_frame_db or need_frame_query:
             print(f"  需要抽取帧: 数据库 {len(need_frame_db)} 个, 查询 {len(need_frame_query)} 个")
-            # 抽取数据库缺失帧
             for db_id in tqdm(need_frame_db, desc="数据库帧抽取", unit="vid"):
                 video_path = id_to_path.get(db_id)
                 if not video_path or not os.path.exists(video_path):
@@ -479,7 +556,6 @@ def main():
                             video_path, db_id, actual_frames_dir, args.first_stage_method,
                             args.max_keyframes, args.lm_threshold, args.ffprobe_path
                         )
-            # 抽取查询缺失帧
             for q_id in tqdm(need_frame_query, desc="查询帧抽取", unit="vid"):
                 video_path = id_to_path.get(q_id)
                 if not video_path or not os.path.exists(video_path):
@@ -494,7 +570,6 @@ def main():
         else:
             print("  所有帧缓存已存在，跳过帧抽取。")
 
-        # [修改点] 子阶段2：特征提取（利用缓存），增加缓存命中统计
         print("\n[子阶段2] 特征提取...")
         db_success = 0
         db_failed = 0
@@ -533,10 +608,10 @@ def main():
             print(f"   失败详情已写入: {log_file}")
         return stage1_time
 
-    # [修改点] 第二阶段：增加缓存命中统计
+    # 阶段2
     def run_stage2():
         print("\n" + "=" * 60)
-        print("第二阶段：关键帧相似度矩阵计算与存储")
+        print(f"第二阶段：关键帧相似度矩阵计算 ({args.sim_type}，阈值 {args.threshold})")
         print("=" * 60)
         stage2_start = time.time()
 
@@ -569,15 +644,25 @@ def main():
                 if db_feat is None:
                     pbar.update(1)
                     continue
-                # [修改点] 检查矩阵是否已存在
-                existing = load_similarity_matrix(q_id, db_id, args.sim_matrices_dir)
-                if existing is not None:
+                # [修改点] 矩阵直接存放在方法目录下，无查询子目录
+                matrix_path = os.path.join(args.sim_matrices_dir, f"{q_id}_{db_id}.npy")
+                if os.path.exists(matrix_path):
                     processed_pairs.add(pair_key)
                     pbar.update(1)
                     cached_pairs += 1
                     continue
-                sim_matrix = compute_keyframe_similarity_matrix(q_feat, db_feat)
-                save_similarity_matrix(sim_matrix, q_id, db_id, args.sim_matrices_dir)
+
+                if args.sim_type == 'chamfer':
+                    with torch.no_grad():
+                        q_feat_device = q_feat.to(device)
+                        db_feat_device = db_feat.to(device)
+                        sim_tensor = model.calculate_f2f_matrix(q_feat_device.unsqueeze(0), db_feat_device.unsqueeze(0))
+                        sim_matrix = sim_tensor.squeeze(0).cpu().numpy()
+                else:
+                    sim_matrix = compute_keyframe_similarity_matrix(q_feat, db_feat)
+
+                # [修改点] 直接保存到 args.sim_matrices_dir
+                np.save(matrix_path, sim_matrix)
                 processed_pairs.add(pair_key)
                 computed_pairs += 1
                 if len(processed_pairs) % 100 == 0:
@@ -632,7 +717,6 @@ def main():
                 print(f"错误: 模型加载失败 - {e}")
                 return
 
-        # 检查阶段1特征是否存在
         need_stage1 = False
         if query_ids and database_ids:
             test_q = query_ids[0]
@@ -648,23 +732,15 @@ def main():
             print("> 检测到阶段1特征缺失，自动执行阶段1...")
             stage1_time = run_stage1(model, device)
 
-        # 检查阶段2矩阵是否存在
-        sim_mat_files = []
-        if os.path.exists(args.sim_matrices_dir):
-            for root, dirs, files in os.walk(args.sim_matrices_dir):
-                for f in files:
-                    if f.endswith('.npy'):
-                        sim_mat_files.append(f)
-                        break
-                if sim_mat_files:
-                    break
-        need_stage2 = len(sim_mat_files) == 0
+        # 检查第二阶段矩阵是否存在
+        matrix_files = glob.glob(os.path.join(args.sim_matrices_dir, '*.npy'))
+        need_stage2 = len(matrix_files) == 0
 
         if need_stage2 and args.stage != '4':
             print("> 检测到阶段2矩阵缺失，自动执行阶段2...")
             stage2_time = run_stage2()
 
-        # 阶段3：密集帧区间提取
+        # 阶段3
         if args.stage in ['3', 'all']:
             print("\n" + "=" * 60)
             print("第三阶段：候选区间定位与密集帧提取")
@@ -698,8 +774,10 @@ def main():
                     pbar.update(len(database_ids))
                     continue
 
+                # [修改点] 查询密集帧保存到 queries/{q_id}/ 下，无 full 子目录
+                query_dense_dir = os.path.join(dense_frames_queries_dir, q_id)
                 if q_id not in query_full_frames_extracted:
-                    num_frames = extract_full_dense_frames(id_to_path[q_id], q_id, args.dense_frames_dir, args.dense_fps)
+                    num_frames = extract_full_dense_frames(id_to_path[q_id], q_id, dense_frames_queries_dir, args.dense_fps)
                     if num_frames > 0:
                         query_full_frames_extracted.add(q_id)
 
@@ -716,10 +794,12 @@ def main():
                     db_fps = db_info.get('fps', 30.0)
                     db_total = db_info.get('total_frames', 0)
 
-                    sim_matrix = load_similarity_matrix(q_id, db_id, args.sim_matrices_dir)
-                    if sim_matrix is None:
+                    # [修改点] 加载矩阵路径
+                    matrix_path = os.path.join(args.sim_matrices_dir, f"{q_id}_{db_id}.npy")
+                    if not os.path.exists(matrix_path):
                         pbar.update(1)
                         continue
+                    sim_matrix = np.load(matrix_path)
 
                     candidate_pairs = find_candidate_pairs(sim_matrix, args.threshold)
                     if not candidate_pairs:
@@ -763,7 +843,7 @@ def main():
                         db_step = db_int['db_step']
 
                         interval_id = f"{q_id}_{db_id}_db{db_start}_{db_end}_step{db_step}"
-                        db_save_dir = os.path.join(args.dense_frames_dir, 'database', db_id, interval_id)
+                        db_save_dir = os.path.join(dense_frames_db_threshold_dir, db_id, interval_id)
 
                         if interval_id in intervals_meta:
                             continue
@@ -782,7 +862,7 @@ def main():
                             'db_end_frame': db_end,
                             'db_step': db_step,
                             'db_save_dir': db_save_dir,
-                            'query_full_dir': os.path.join(args.dense_frames_dir, 'queries', q_id, 'full')
+                            'query_full_dir': query_dense_dir   # [修改点] 无 full
                         }
 
                     pbar.update(1)
@@ -798,9 +878,8 @@ def main():
                 print("> 警告：未找到任何候选区间，跳过第四阶段和评估。")
                 return
 
-        # 阶段4：密集帧相似度计算
+        # 阶段4
         if args.stage in ['4', 'all']:
-            # 如果只运行阶段4，需要加载intervals_meta
             if args.stage == '4' and not intervals_meta:
                 if os.path.exists(args.intervals_meta):
                     with open(args.intervals_meta, 'r') as f:
@@ -843,13 +922,13 @@ def main():
                     pbar.update(1)
                     continue
 
-                # 加载查询全局特征
                 query_feat_key = f"query_full_{q_id}"
                 if query_feat_key in feature_cache:
                     q_feat = feature_cache[query_feat_key]
                 else:
                     query_full_dir = intervals_list[0]['query_full_dir']
-                    query_feat_path = os.path.join(args.dense_features_dir, 'queries', q_id, f"{q_id}_full.npy")
+                    # [修改点] 查询密集特征路径无 full
+                    query_feat_path = os.path.join(dense_features_queries_dir, q_id, f"{q_id}_dense.npy")
                     if os.path.exists(query_feat_path):
                         try:
                             q_feat_np = np.load(query_feat_path)
@@ -864,14 +943,16 @@ def main():
                         q_feat = None
 
                     if q_feat is None:
-                        q_frames_info = get_sorted_frames_from_dir(query_full_dir)
-                        if q_frames_info is None:
+                        num_q_frames = get_sorted_frames_count(query_full_dir)
+                        if num_q_frames == 0:
                             pbar.update(1)
                             continue
-                        q_imgs = [img for _, img in q_frames_info]
-                        # 分批提取特征（内部已包含 224 缩放）
-                        q_feat = _extract_features_from_list(
-                            model, q_imgs, f"{q_id}_full", args.dense_features_dir,
+                        q_gen = get_sorted_frames_generator(query_full_dir)
+                        if q_gen is None:
+                            pbar.update(1)
+                            continue
+                        q_feat = _extract_features_from_generator(
+                            model, q_gen, num_q_frames, f"{q_id}_dense", dense_features_queries_dir,
                             device, args.batch_sz, expected_dims
                         )
                         if q_feat is None:
@@ -879,12 +960,11 @@ def main():
                             continue
                         feature_cache[query_feat_key] = q_feat
 
-                # 加载数据库区间合并特征
                 db_feat_key = f"db_{db_id}_" + "_".join(sorted([meta['db_save_dir'] for meta in intervals_list]))
                 if db_feat_key in feature_cache:
                     db_feat = feature_cache[db_feat_key]
                 else:
-                    db_merged_feat_path = os.path.join(args.dense_features_dir, 'database', db_id, f"{db_id}_merged.npy")
+                    db_merged_feat_path = os.path.join(dense_features_db_threshold_dir, db_id, f"{db_id}_merged.npy")
                     if os.path.exists(db_merged_feat_path):
                         try:
                             db_feat_np = np.load(db_merged_feat_path)
@@ -899,26 +979,41 @@ def main():
                         db_feat = None
 
                     if db_feat is None:
-                        all_db_frames = []
+                        import heapq
+                        generators = []
                         for meta in intervals_list:
-                            db_dir = meta['db_save_dir']
-                            frames_info = get_sorted_frames_from_dir(db_dir)
-                            if frames_info is None:
-                                continue
-                            all_db_frames.extend(frames_info)
-                        if not all_db_frames:
+                            gen = get_sorted_frames_generator(meta['db_save_dir'])
+                            if gen is not None:
+                                generators.append(gen)
+                        if not generators:
                             pbar.update(1)
                             continue
-                        all_db_frames.sort(key=lambda x: x[0])
-                        unique_db_frames = []
-                        seen = set()
-                        for idx, img in all_db_frames:
-                            if idx not in seen:
-                                seen.add(idx)
-                                unique_db_frames.append((idx, img))
-                        db_imgs = [img for _, img in unique_db_frames]
-                        db_feat = _extract_features_from_list(
-                            model, db_imgs, f"{db_id}_merged", args.dense_features_dir,
+
+                        heap = []
+                        for i, gen in enumerate(generators):
+                            try:
+                                idx, img = next(gen)
+                                heapq.heappush(heap, (idx, i, img, gen))
+                            except StopIteration:
+                                pass
+
+                        def merged_gen():
+                            seen = set()
+                            while heap:
+                                idx, i, img, gen = heapq.heappop(heap)
+                                if idx not in seen:
+                                    seen.add(idx)
+                                    yield idx, img
+                                try:
+                                    next_idx, next_img = next(gen)
+                                    heapq.heappush(heap, (next_idx, i, next_img, gen))
+                                except StopIteration:
+                                    pass
+
+                        total_db_frames = sum(get_sorted_frames_count(meta['db_save_dir']) for meta in intervals_list)
+                        merge_gen = merged_gen()
+                        db_feat = _extract_features_from_generator(
+                            model, merge_gen, total_db_frames, f"{db_id}_merged", dense_features_db_threshold_dir,
                             device, args.batch_sz, expected_dims
                         )
                         if db_feat is None:
@@ -928,8 +1023,9 @@ def main():
 
                 sim_val = compute_dense_similarity(model, q_feat, db_feat)
 
-                heatmap_path = os.path.join(args.heatmaps_dir, q_id, f"{db_id}_merged.png")
-                matrix_save_path = os.path.join(args.sim_matrices_dense_dir, q_id, f"{db_id}_merged.npy")
+                os.makedirs(args.heatmaps_dir, exist_ok=True)
+                heatmap_path = os.path.join(args.heatmaps_dir, f"{q_id}_{db_id}_merged.png")
+                matrix_save_path = os.path.join(args.sim_matrices_dense_dir, f"{q_id}_{db_id}_merged.npy")
                 compute_and_save_heatmap(model, q_feat, db_feat, heatmap_path, matrix_save_path)
 
                 if q_id not in similarities:
@@ -950,12 +1046,11 @@ def main():
 
             pbar.close()
 
-            final_sim_file = os.path.join(args.output_dir, f"similarities_{method_suffix}{model_suffix}_th{args.threshold}.json")
+            final_sim_file = os.path.join(args.output_dir, f"similarities_{threshold_str_dir}.json")
             with open(final_sim_file, 'w') as f:
                 json.dump(similarities, f, separators=(',', ':'))
             print(f"> 最终相似度保存至: {final_sim_file}")
 
-            # [修改点] 若指定了检测阈值，生成二分类预测结果但不进行评估（评估移至第五阶段）
             if args.detection_threshold is not None:
                 detection_results = {}
                 for q_id, db_scores in similarities.items():
@@ -975,7 +1070,6 @@ def main():
 
         total_time = time.time() - total_start
 
-        # 评估 mAP (仅当运行了阶段4或all时)
         if args.stage in ['4', 'all'] and similarities:
             print("\n" + "=" * 60)
             print("检索排序评估 (mAP)")
@@ -992,7 +1086,7 @@ def main():
                 else:
                     raise ValueError(f"未知数据集: {args.dataset}")
                 eval_results = dataset.evaluate(similarities)
-                eval_file = os.path.join(args.output_dir, f"evaluation_{method_suffix}{model_suffix}_th{args.threshold}.json")
+                eval_file = os.path.join(args.output_dir, f"evaluation_{threshold_str_dir}.json")
                 with open(eval_file, 'w') as f:
                     json.dump(eval_results, f, indent=2)
                 if args.dataset == 'VCDB':
@@ -1008,6 +1102,7 @@ def main():
                 'dataset': args.dataset,
                 'first_stage_method': args.first_stage_method,
                 'threshold': args.threshold,
+                'sim_type': args.sim_type,
                 'dense_fps': args.dense_fps,
                 'stage1_time': stage1_time,
                 'stage2_time': stage2_time,
@@ -1016,27 +1111,24 @@ def main():
                 'total_time': total_time,
                 'device': 'GPU' if not args.cpu_only and torch.cuda.is_available() else 'CPU'
             }
-            summary_file = os.path.join(args.output_dir, f"summary_{method_suffix}{model_suffix}_th{args.threshold}.json")
+            summary_file = os.path.join(args.output_dir, f"summary_{threshold_str_dir}.json")
             with open(summary_file, 'w') as f:
                 json.dump(summary, f, indent=2)
             print(f"> 总结保存: {summary_file}")
 
-    # [修改点] 第五阶段：独立二分类评估，包含缺失分数补全与Platt Scaling校准
     if args.stage in ['5', 'all']:
         print("\n" + "=" * 60)
-        print("第五阶段：二分类检测评估（含缺失补全与概率校准）")
+        print("第五阶段：二分类检测评估")
         print("=" * 60)
         stage5_start = time.time()
 
-        # 加载相似度分数文件
-        sim_file = os.path.join(args.output_dir, f"similarities_{method_suffix}{model_suffix}_th{args.threshold}.json")
+        sim_file = os.path.join(args.output_dir, f"similarities_{threshold_str_dir}.json")
         if not os.path.exists(sim_file):
             print(f"> 错误: 相似度文件不存在 {sim_file}")
             return
         with open(sim_file, 'r') as f:
             similarities = json.load(f)
 
-        # [修改点] 补全缺失视频对分数为 -1.0
         print("> 补全缺失视频对相似度分数 (-1.0)...")
         for q_id in query_ids:
             if q_id not in similarities:
@@ -1045,7 +1137,6 @@ def main():
                 if db_id not in similarities[q_id]:
                     similarities[q_id][db_id] = -1.0
 
-        # 构建真实标签
         print("> 构建真实标签...")
         y_true, raw_scores = [], []
         if args.dataset == 'VCDB':
@@ -1084,28 +1175,21 @@ def main():
         y_true = np.array(y_true)
         raw_scores = np.array(raw_scores)
 
-        # [修改点] Platt Scaling 概率校准 (使用逻辑回归)
-        print("> 训练 Platt Scaling 校准器 (逻辑回归)...")
+        print("> 训练 Platt Scaling 校准器...")
         from sklearn.linear_model import LogisticRegression
         from sklearn.model_selection import train_test_split
+        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 
-        # 划分训练/测试集用于校准器训练与评估 (80%训练校准器，20%测试)
         X = raw_scores.reshape(-1, 1)
         y = y_true
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 
-        # 训练 Platt Scaling (逻辑回归)
         calib = LogisticRegression(penalty='l2', C=1.0, solver='lbfgs', max_iter=1000)
         calib.fit(X_train, y_train)
 
-        # 对全量数据进行概率预测
-        proba = calib.predict_proba(X)[:, 1]  # 正类概率
-
-        # [修改点] 使用校准概率进行二分类决策 (默认阈值0.5)
+        proba = calib.predict_proba(X)[:, 1]
         pred_labels = (proba >= args.detection_threshold).astype(int)
 
-        # 计算指标
-        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
         acc = accuracy_score(y_true, pred_labels)
         prec = precision_score(y_true, pred_labels, zero_division=0)
         rec = recall_score(y_true, pred_labels, zero_division=0)
@@ -1117,10 +1201,10 @@ def main():
         print(f"总样本数: {len(y_true)}")
         print(f"正样本数: {np.sum(y_true)}")
         print("-" * 30)
-        print(f"准确率 (Accuracy):  {acc:.4f}")
-        print(f"精确率 (Precision): {prec:.4f}")
-        print(f"召回率 (Recall):    {rec:.4f}")
-        print(f"F1 分数:           {f1:.4f}")
+        print(f"准确率:  {acc:.4f}")
+        print(f"精确率:  {prec:.4f}")
+        print(f"召回率:  {rec:.4f}")
+        print(f"F1 分数: {f1:.4f}")
         print("-" * 30)
         print("混淆矩阵:")
         print(f"           预测负类  预测正类")
@@ -1128,16 +1212,15 @@ def main():
         print(f"真实正类:  {cm[1,0]:6d}    {cm[1,1]:6d}")
         print("=" * 50)
 
-        # 保存校准器与评估结果
         import joblib
-        calib_file = os.path.join(args.output_dir, f"platt_calibrator_{method_suffix}{model_suffix}_th{args.threshold}.pkl")
+        calib_file = os.path.join(args.output_dir, f"platt_calibrator_{threshold_str_dir}.pkl")
         joblib.dump(calib, calib_file)
         print(f"> Platt校准器已保存至: {calib_file}")
 
-        metrics_file = os.path.join(args.output_dir, f"detection_metrics_calibrated_{method_suffix}{model_suffix}_th{args.threshold}.json")
+        metrics_file = os.path.join(args.output_dir, f"detection_metrics_calibrated_{threshold_str_dir}.json")
         with open(metrics_file, 'w') as f:
             json.dump({
-                'threshold': 0.5,
+                'threshold': args.detection_threshold,
                 'accuracy': acc, 'precision': prec, 'recall': rec, 'f1': f1,
                 'confusion_matrix': cm.tolist()
             }, f, indent=2)
@@ -1156,7 +1239,7 @@ if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
-        print("\n> 用户中断，程序退出")
+        print("\n> 用户中断")
     except Exception as e:
         print(f"\n> 未捕获异常: {e}")
         traceback.print_exc()
