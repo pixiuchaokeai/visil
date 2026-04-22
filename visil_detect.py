@@ -3,9 +3,9 @@ visil_detect.py
 
 分阶段视频拷贝检测评估脚本（基于 ViSiL 关键帧特征）：
 
-阶段1：关键帧提取 + 特征提取 + 帧间 Chamfer 相似度矩阵计算
-阶段2：基于矩阵计算视频级相似度（经 VideoComperator CNN）并记录矩阵最大值
-阶段3：检测评估（直接阈值，输出 mAP 及二分类指标，含视频级和矩阵最大值两种方式）
+阶段1：关键帧提取 + 特征提取 + 帧间 Chamfer 相似度矩阵计算 + 矩阵统计量记录
+阶段2：基于矩阵计算视频级相似度（经 VideoComperator CNN）
+阶段3：检测评估（直接阈值，输出 mAP 及二分类指标，含视频级和多种矩阵统计量方式）
 阶段4：热图输出（帧间相似度矩阵热图，自动去重）
 
 可通过 --stage 参数控制执行阶段，便于调节检测阈值多次评估。
@@ -103,19 +103,21 @@ def main():
     parser.add_argument('--features_dir', type=str, default='features1')
     parser.add_argument('--output_dir', type=str, default=None)
     parser.add_argument('--ffprobe_path', type=str, default='ffprobe')
-    parser.add_argument('--detection_threshold', type=float, default=-0.5,
+    # [修改点] 重命名视频级相似度阈值参数
+    parser.add_argument('--video_threshold', type=float, default=-0.5,
                         help='二分类检测阈值（视频级相似度）')
-    # [修改点] 新增帧间矩阵检测阈值参数
-    parser.add_argument('--f2f_threshold', type=float, default=0.06,
+    # [修改点] 重命名帧间矩阵最大值阈值参数
+    parser.add_argument('--max_threshold', type=float, default=0.06,
                         help='帧间相似度矩阵检测阈值，若矩阵中存在任意值 >= 该阈值则判定为同源')
-    # [修改点] 新增双向平均阈值参数
+    # [修改点] 双向平均阈值参数
     parser.add_argument('--algebraic_threshold', type=float, default=0.0325,
                         help='行/列最大值代数均值阈值，若均值 >= 该阈值则判定为同源')
     parser.add_argument('--harmonic_threshold', type=float, default=0.03125,
                         help='行/列最大值调和均值阈值，若均值 >= 该阈值则判定为同源')
+    # [修改点] 删除归一化阈值参数（不再使用）
     parser.add_argument('--sim_matrices_dir', type=str, default=None)
     parser.add_argument('--heatmaps_dir', type=str, default=None)
-    parser.add_argument('--stage', type=str, default='all',
+    parser.add_argument('--stage', type=str, default='3',
                         choices=['1', '2', '3', '4', 'all'],
                         help='执行阶段：1-矩阵计算，2-视频相似度，3-检测评估，4-热图输出，all-全部')
 
@@ -184,11 +186,9 @@ def main():
         dataset = VCDB(root_dir=vcdb_root, pickle_path=os.path.join(vcdb_root, 'vcdb_cleaned.pickle'))
         print(f"> VCDB 数据集加载成功")
 
-        # 查询视频列表 = query_to_database 的所有键
         query_ids = dataset.get_queries()
         print(f"> 查询视频数: {len(query_ids)}")
 
-        # 读取数据库文件获取数据库视频列表及路径
         if args.database_file and os.path.exists(args.database_file):
             with open(args.database_file, 'r') as f:
                 for line in f:
@@ -206,7 +206,6 @@ def main():
             print(f"> 错误: 数据库文件不存在 {args.database_file}")
             return
 
-        # 为查询视频补全路径（查询视频可能不在数据库文件中，但通常都在）
         for qid in query_ids:
             if qid not in id_to_path:
                 path_candidate = os.path.join(args.video_dir, args.pattern.format(id=qid))
@@ -219,7 +218,6 @@ def main():
                             break
                 id_to_path[qid] = path_candidate
 
-        # 过滤掉路径无效的查询视频
         valid_queries = [q for q in query_ids if q in id_to_path and os.path.exists(id_to_path[q])]
         if len(valid_queries) < len(query_ids):
             print(f"> 警告: {len(query_ids) - len(valid_queries)} 个查询视频路径无效，将被忽略")
@@ -227,7 +225,6 @@ def main():
         print(f"> 有效查询视频数: {len(query_ids)}")
 
     else:
-        # 非 VCDB 数据集的通用处理（保持原逻辑）
         if args.query_file and os.path.exists(args.query_file):
             try:
                 with open(args.query_file, 'r') as f:
@@ -266,7 +263,6 @@ def main():
         else:
             print(f"> 警告: 未指定有效的数据库列表文件")
 
-        # 补全缺失路径
         for vid in query_ids + database_ids:
             if vid not in id_to_path:
                 path_candidate = os.path.join(args.video_dir, args.pattern.format(id=vid))
@@ -285,10 +281,13 @@ def main():
         model.eval()
         print("> 模型加载成功")
 
+    # [修改点] 定义矩阵统计量缓存文件路径（保留均值、标准差等统计量）
+    matrix_stats_cache_file = os.path.join(args.output_dir, f"matrix_stats_{method_suffix}{model_suffix}.json")
+
     # ========== 阶段1 ==========
     if args.stage in ['1', 'all']:
         print("\n" + "=" * 60)
-        print("阶段1：关键帧提取、特征计算与帧间相似度矩阵")
+        print("阶段1：关键帧提取、特征计算与帧间相似度矩阵及统计量")
         print("=" * 60)
         stage1_start = time.time()
 
@@ -357,7 +356,6 @@ def main():
                         fail_log.write(f"[{video_type}] {video_id}: JPG 读取失败\n")
                         return False
 
-            # 特征提取
             feat_path = os.path.join(actual_features_dir, video_id, f"{video_id}.npy")
             os.makedirs(os.path.dirname(feat_path), exist_ok=True)
             resized_frames = []
@@ -413,10 +411,20 @@ def main():
                 query_success += 1
         fail_log.close()
 
-        print("\n[子阶段3] 帧间相似度矩阵计算...")
+        print("\n[子阶段3] 帧间相似度矩阵计算与统计量记录...")
         stage1_matrix_start = time.time()
         matrices_computed = 0
         matrices_cached = 0
+
+        matrix_stats = {}
+        if os.path.exists(matrix_stats_cache_file):
+            try:
+                with open(matrix_stats_cache_file, 'r') as f:
+                    matrix_stats = json.load(f)
+                print(f"> 加载已有矩阵统计量缓存，{len(matrix_stats)} 条记录")
+            except:
+                print("> 警告: 统计量缓存损坏，将重新计算")
+
         pbar = tqdm(total=len(query_ids) * len(database_ids), desc="矩阵计算", unit="pair")
         for q_id in query_ids:
             q_feat = load_features(q_id, actual_features_dir, expected_dims)
@@ -425,25 +433,75 @@ def main():
                 continue
             q_feat_device = q_feat.to(device)
             for db_id in database_ids:
-                matrix_path = os.path.join(args.sim_matrices_dir, f"{q_id}_{db_id}.npy")
-                if os.path.exists(matrix_path):
+                pair_str = f"{q_id}_{db_id}"
+                matrix_path = os.path.join(args.sim_matrices_dir, f"{pair_str}.npy")
+
+                if os.path.exists(matrix_path) and pair_str in matrix_stats:
                     matrices_cached += 1
                     pbar.update(1)
                     continue
-                db_feat = load_features(db_id, actual_features_dir, expected_dims)
-                if db_feat is None:
-                    pbar.update(1)
-                    continue
-                db_feat_device = db_feat.to(device)
-                with torch.no_grad():
-                    sim_tensor = model.calculate_f2f_matrix(q_feat_device.unsqueeze(0), db_feat_device.unsqueeze(0))
-                    sim_matrix = sim_tensor.squeeze(0).cpu().numpy()
-                np.save(matrix_path, sim_matrix)
-                matrices_computed += 1
+
+                if not os.path.exists(matrix_path):
+                    db_feat = load_features(db_id, actual_features_dir, expected_dims)
+                    if db_feat is None:
+                        pbar.update(1)
+                        continue
+                    db_feat_device = db_feat.to(device)
+                    with torch.no_grad():
+                        sim_tensor = model.calculate_f2f_matrix(q_feat_device.unsqueeze(0), db_feat_device.unsqueeze(0))
+                        sim_matrix = sim_tensor.squeeze(0).cpu().numpy()
+                    np.save(matrix_path, sim_matrix)
+                    matrices_computed += 1
+                    del db_feat_device
+                else:
+                    sim_matrix = np.load(matrix_path)
+
+                # [修改点] 计算并记录矩阵统计量（含均值、标准差、最值等）
+                try:
+                    max_val = float(np.max(sim_matrix))
+                    row_mean = float(np.mean(np.max(sim_matrix, axis=1)))
+                    col_mean = float(np.mean(np.max(sim_matrix, axis=0)))
+                    alg_mean = (row_mean + col_mean) / 2.0
+                    if row_mean + col_mean > 0:
+                        harm_mean = 2.0 * row_mean * col_mean / (row_mean + col_mean + 1e-8)
+                    else:
+                        harm_mean = 0.0
+
+                    matrix_mean = float(np.mean(sim_matrix))
+                    matrix_std = float(np.std(sim_matrix))
+                    matrix_min = float(np.min(sim_matrix))
+                    matrix_max = float(np.max(sim_matrix))
+
+                    stats = {
+                        'max': max_val,
+                        'row_mean': row_mean,
+                        'col_mean': col_mean,
+                        'alg_mean': alg_mean,
+                        'harm_mean': harm_mean,
+                        'matrix_mean': matrix_mean,
+                        'matrix_std': matrix_std,
+                        'matrix_min': matrix_min,
+                        'matrix_max': matrix_max
+                    }
+                except:
+                    stats = {'max': -1.0, 'row_mean': -1.0, 'col_mean': -1.0,
+                             'alg_mean': -1.0, 'harm_mean': -1.0,
+                             'matrix_mean': 0.0, 'matrix_std': 0.0,
+                             'matrix_min': 0.0, 'matrix_max': 0.0}
+
+                matrix_stats[pair_str] = stats
                 pbar.update(1)
-                del db_feat_device
+
+                if len(matrix_stats) % 1000 == 0:
+                    with open(matrix_stats_cache_file, 'w') as f:
+                        json.dump(matrix_stats, f)
             del q_feat_device
+
         pbar.close()
+        with open(matrix_stats_cache_file, 'w') as f:
+            json.dump(matrix_stats, f)
+        print(f"> 矩阵统计量缓存已保存: {matrix_stats_cache_file}")
+
         stage1_matrix_time = time.time() - stage1_matrix_start
         stage1_time = time.time() - stage1_start
         print(f"> 阶段1完成，总耗时 {stage1_time:.2f}s")
@@ -453,7 +511,7 @@ def main():
     # ========== 阶段2 ==========
     if args.stage in ['2', 'all']:
         print("\n" + "=" * 60)
-        print("阶段2：视频级相似度计算（含 CNN 后处理）及矩阵最大值记录")
+        print("阶段2：视频级相似度计算（含 CNN 后处理）")
         print("=" * 60)
         stage2_start = time.time()
 
@@ -469,18 +527,6 @@ def main():
             last_frame = feat[-1:].clone()
             padding = last_frame.repeat(pad_size, 1, 1)
             return torch.cat([feat, padding], dim=0)
-
-        # [修改点] 定义矩阵统计量缓存文件路径
-        matrix_stats_cache_file = os.path.join(args.output_dir, f"matrix_stats_{method_suffix}{model_suffix}.json")
-        # [修改点] 加载已有统计量缓存（用于断点续算）
-        matrix_stats = {}
-        if os.path.exists(matrix_stats_cache_file):
-            try:
-                with open(matrix_stats_cache_file, 'r') as f:
-                    matrix_stats = json.load(f)
-                print(f"> 加载矩阵统计量缓存，已有 {len(matrix_stats)} 条记录")
-            except:
-                print("> 警告: 矩阵统计量缓存文件损坏，将重新计算")
 
         similarities = {}
         checkpoint_file = os.path.join(args.output_dir, 'stage2_checkpoint.json')
@@ -515,61 +561,19 @@ def main():
                 db_feat = pad_features_to_min_frames(db_feat, min_frames=4)
                 db_feat_device = db_feat.to(device)
 
-                # [修改点] 获取或计算矩阵统计量（最大值、行/列均值、代数均值、调和均值）
-                pair_str = f"{q_id}_{db_id}"
-                if pair_str in matrix_stats:
-                    stats = matrix_stats[pair_str]
-                else:
-                    matrix_path = os.path.join(args.sim_matrices_dir, f"{pair_str}.npy")
-                    if os.path.exists(matrix_path):
-                        try:
-                            matrix = np.load(matrix_path)
-                            max_val = float(np.max(matrix))
-                            row_mean = float(np.mean(np.max(matrix, axis=1)))
-                            col_mean = float(np.mean(np.max(matrix, axis=0)))
-                            # 代数均值（算术平均）
-                            alg_mean = (row_mean + col_mean) / 2.0
-                            # 调和均值
-                            if row_mean + col_mean > 0:
-                                harm_mean = 2.0 * row_mean * col_mean / (row_mean + col_mean + 1e-8)
-                            else:
-                                harm_mean = 0.0
-                            stats = {
-                                'max': max_val,
-                                'row_mean': row_mean,
-                                'col_mean': col_mean,
-                                'alg_mean': alg_mean,
-                                'harm_mean': harm_mean
-                            }
-                        except:
-                            stats = {'max': -1.0, 'row_mean': -1.0, 'col_mean': -1.0,
-                                     'alg_mean': -1.0, 'harm_mean': -1.0}
-                    else:
-                        stats = {'max': -1.0, 'row_mean': -1.0, 'col_mean': -1.0,
-                                 'alg_mean': -1.0, 'harm_mean': -1.0}
-                    matrix_stats[pair_str] = stats
-
                 with torch.no_grad():
                     sim_val = model.calculate_video_similarity(q_feat_device.unsqueeze(0), db_feat_device.unsqueeze(0))
                 similarities[q_id][db_id] = float(sim_val.item())
                 processed_pairs.add(pair_key)
                 pbar.update(1)
 
-                # [修改点] 定期保存检查点和统计量缓存
                 if len(processed_pairs) % 1000 == 0:
                     with open(checkpoint_file, 'w') as f:
                         json.dump({'similarities': similarities, 'processed_pairs': list(processed_pairs)}, f)
-                    with open(matrix_stats_cache_file, 'w') as f:
-                        json.dump(matrix_stats, f)
                 del db_feat_device
             del q_feat_device
             gc.collect()
         pbar.close()
-
-        # [修改点] 最终保存统计量缓存
-        with open(matrix_stats_cache_file, 'w') as f:
-            json.dump(matrix_stats, f)
-        print(f"> 矩阵统计量缓存已保存: {matrix_stats_cache_file}")
 
         stage2_time = time.time() - stage2_start
         print(f"> 阶段2完成，耗时 {stage2_time:.2f}s")
@@ -582,7 +586,7 @@ def main():
         if os.path.exists(checkpoint_file):
             os.remove(checkpoint_file)
 
-    # [修改点] ========== 阶段3：检测评估 ==========
+    # ========== 阶段3：检测评估 ==========
     if args.stage in ['3', 'all']:
         print("\n" + "=" * 60)
         print("阶段3：检测评估")
@@ -596,8 +600,7 @@ def main():
         with open(sim_file, 'r') as f:
             similarities = json.load(f)
 
-        # [修改点] 加载矩阵统计量缓存，若无则动态计算并保存
-        matrix_stats_cache_file = os.path.join(args.output_dir, f"matrix_stats_{method_suffix}{model_suffix}.json")
+        # [修改点] 加载矩阵统计量缓存（若无则现场计算）
         matrix_stats = {}
         if os.path.exists(matrix_stats_cache_file):
             with open(matrix_stats_cache_file, 'r') as f:
@@ -621,19 +624,33 @@ def main():
                                 harm_mean = 2.0 * row_mean * col_mean / (row_mean + col_mean + 1e-8)
                             else:
                                 harm_mean = 0.0
+
+                            matrix_mean = float(np.mean(matrix))
+                            matrix_std = float(np.std(matrix))
+                            matrix_min = float(np.min(matrix))
+                            matrix_max = float(np.max(matrix))
+
                             stats = {
                                 'max': max_val,
                                 'row_mean': row_mean,
                                 'col_mean': col_mean,
                                 'alg_mean': alg_mean,
-                                'harm_mean': harm_mean
+                                'harm_mean': harm_mean,
+                                'matrix_mean': matrix_mean,
+                                'matrix_std': matrix_std,
+                                'matrix_min': matrix_min,
+                                'matrix_max': matrix_max
                             }
                         except:
                             stats = {'max': -1.0, 'row_mean': -1.0, 'col_mean': -1.0,
-                                     'alg_mean': -1.0, 'harm_mean': -1.0}
+                                     'alg_mean': -1.0, 'harm_mean': -1.0,
+                                     'matrix_mean': 0.0, 'matrix_std': 0.0,
+                                     'matrix_min': 0.0, 'matrix_max': 0.0}
                     else:
                         stats = {'max': -1.0, 'row_mean': -1.0, 'col_mean': -1.0,
-                                 'alg_mean': -1.0, 'harm_mean': -1.0}
+                                 'alg_mean': -1.0, 'harm_mean': -1.0,
+                                 'matrix_mean': 0.0, 'matrix_std': 0.0,
+                                 'matrix_min': 0.0, 'matrix_max': 0.0}
                     matrix_stats[pair_str] = stats
                     pbar.update(1)
             pbar.close()
@@ -670,7 +687,7 @@ def main():
             print(f"> 评估失败: {e}")
 
         # ---------- 二分类检测评估（基于视频级相似度） ----------
-        print(f"\n> 二分类检测评估 [视频级相似度] (阈值 = {args.detection_threshold})...")
+        print(f"\n> 二分类检测评估 [视频级相似度] (阈值 = {args.video_threshold})...")
         y_true_video, raw_scores_video = [], []
         if args.dataset == 'VCDB':
             positive_set = {}
@@ -703,7 +720,7 @@ def main():
         if y_true_video:
             y_true_video = np.array(y_true_video)
             raw_scores_video = np.array(raw_scores_video)
-            pred_labels_video = (raw_scores_video >= args.detection_threshold).astype(int)
+            pred_labels_video = (raw_scores_video >= args.video_threshold).astype(int)
             from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
             acc_v = accuracy_score(y_true_video, pred_labels_video)
             prec_v = precision_score(y_true_video, pred_labels_video, zero_division=0)
@@ -719,8 +736,8 @@ def main():
             print(f"    TP: {tp_v:6d}  FP: {fp_v:6d}")
             print(f"    FN: {fn_v:6d}  TN: {tn_v:6d}")
 
-        # [修改点] ---------- 二分类检测评估（基于帧间矩阵最大值） ----------
-        print(f"\n> 二分类检测评估 [帧间矩阵最大值] (阈值 = {args.f2f_threshold})...")
+        # ---------- 二分类检测评估（基于帧间矩阵最大值） ----------
+        print(f"\n> 二分类检测评估 [帧间矩阵最大值] (阈值 = {args.max_threshold})...")
         y_true_matrix, pred_labels_matrix = [], []
         missing_matrix = 0
         for q_id in query_ids:
@@ -742,7 +759,7 @@ def main():
                 max_val = stats.get('max', -1.0)
                 if max_val == -1.0 and not os.path.exists(os.path.join(args.sim_matrices_dir, f"{pair_str}.npy")):
                     missing_matrix += 1
-                pred = 1 if max_val >= args.f2f_threshold else 0
+                pred = 1 if max_val >= args.max_threshold else 0
                 pred_labels_matrix.append(pred)
 
         if missing_matrix > 0:
@@ -765,7 +782,7 @@ def main():
             print(f"    TP: {tp_m:6d}  FP: {fp_m:6d}")
             print(f"    FN: {fn_m:6d}  TN: {tn_m:6d}")
 
-        # [修改点] ---------- 二分类检测评估（基于代数均值） ----------
+        # ---------- 二分类检测评估（基于代数均值） ----------
         print(f"\n> 二分类检测评估 [代数均值] (阈值 = {args.algebraic_threshold})...")
         y_true_alg, pred_labels_alg = [], []
         for q_id in query_ids:
@@ -805,7 +822,7 @@ def main():
             print(f"    TP: {tp_alg:6d}  FP: {fp_alg:6d}")
             print(f"    FN: {fn_alg:6d}  TN: {tn_alg:6d}")
 
-        # [修改点] ---------- 二分类检测评估（基于调和均值） ----------
+        # ---------- 二分类检测评估（基于调和均值） ----------
         print(f"\n> 二分类检测评估 [调和均值] (阈值 = {args.harmonic_threshold})...")
         y_true_harm, pred_labels_harm = [], []
         for q_id in query_ids:
@@ -848,7 +865,7 @@ def main():
         stage3_time = time.time() - stage3_start
         print(f"> 阶段3完成，耗时 {stage3_time:.2f}s")
 
-    # ========== 阶段4：热图输出（去重） ==========
+    # ========== 阶段4：热图输出 ==========
     if args.stage in ['4', 'all']:
         print("\n" + "=" * 60)
         print("阶段4：热图输出")
