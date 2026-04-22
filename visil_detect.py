@@ -4,8 +4,8 @@ visil_detect.py
 分阶段视频拷贝检测评估脚本（基于 ViSiL 关键帧特征）：
 
 阶段1：关键帧提取 + 特征提取 + 帧间 Chamfer 相似度矩阵计算
-阶段2：基于矩阵计算视频级相似度（经 VideoComperator CNN）
-阶段3：检测评估（直接阈值，输出 mAP 及二分类指标）
+阶段2：基于矩阵计算视频级相似度（经 VideoComperator CNN）并记录矩阵最大值
+阶段3：检测评估（直接阈值，输出 mAP 及二分类指标，含视频级和矩阵最大值两种方式）
 阶段4：热图输出（帧间相似度矩阵热图，自动去重）
 
 可通过 --stage 参数控制执行阶段，便于调节检测阈值多次评估。
@@ -56,7 +56,7 @@ DATASET_PRESETS = {
     },
     "VCDB": {
         "video_dir": "datasets/VCDB/core_dataset/core_dataset",
-        "query_file": None,  # [修改点] VCDB 不使用外部查询文件，从 pickle 获取查询集
+        "query_file": None,
         "database_file": "datasets/VCDB/core_dataset/vcdb_cleaned_database.txt",
         "pattern": "{id}.flv"
     },
@@ -90,8 +90,8 @@ def main():
     parser.add_argument('--pattern', type=str, default=None)
     parser.add_argument('--query_file', type=str, default=None)
     parser.add_argument('--database_file', type=str, default=None)
-    parser.add_argument('--first_stage_method', type=str, default='default',
-                        choices=['default', '2s', 'local_maxima', 'iframe', 'i_p_mixed'])
+    parser.add_argument('--first_stage_method', type=str, default='iframe',
+                        choices=['default', '2s', 'local_maxima', 'iframe', 'i_p_mixed', 'shot'])
     parser.add_argument('--max_keyframes', type=int, default=0)
     parser.add_argument('--lm_threshold', type=float, default=0.6)
     parser.add_argument('--batch_sz', type=int, default=4)
@@ -103,11 +103,19 @@ def main():
     parser.add_argument('--features_dir', type=str, default='features1')
     parser.add_argument('--output_dir', type=str, default=None)
     parser.add_argument('--ffprobe_path', type=str, default='ffprobe')
-    parser.add_argument('--detection_threshold', type=float, default=-0.625,
-                        help='二分类检测阈值')
+    parser.add_argument('--detection_threshold', type=float, default=-0.5,
+                        help='二分类检测阈值（视频级相似度）')
+    # [修改点] 新增帧间矩阵检测阈值参数
+    parser.add_argument('--f2f_threshold', type=float, default=0.06,
+                        help='帧间相似度矩阵检测阈值，若矩阵中存在任意值 >= 该阈值则判定为同源')
+    # [修改点] 新增双向平均阈值参数
+    parser.add_argument('--algebraic_threshold', type=float, default=0.0325,
+                        help='行/列最大值代数均值阈值，若均值 >= 该阈值则判定为同源')
+    parser.add_argument('--harmonic_threshold', type=float, default=0.03125,
+                        help='行/列最大值调和均值阈值，若均值 >= 该阈值则判定为同源')
     parser.add_argument('--sim_matrices_dir', type=str, default=None)
     parser.add_argument('--heatmaps_dir', type=str, default=None)
-    parser.add_argument('--stage', type=str, default='3',
+    parser.add_argument('--stage', type=str, default='all',
                         choices=['1', '2', '3', '4', 'all'],
                         help='执行阶段：1-矩阵计算，2-视频相似度，3-检测评估，4-热图输出，all-全部')
 
@@ -445,7 +453,7 @@ def main():
     # ========== 阶段2 ==========
     if args.stage in ['2', 'all']:
         print("\n" + "=" * 60)
-        print("阶段2：视频级相似度计算（含 CNN 后处理）")
+        print("阶段2：视频级相似度计算（含 CNN 后处理）及矩阵最大值记录")
         print("=" * 60)
         stage2_start = time.time()
 
@@ -461,6 +469,18 @@ def main():
             last_frame = feat[-1:].clone()
             padding = last_frame.repeat(pad_size, 1, 1)
             return torch.cat([feat, padding], dim=0)
+
+        # [修改点] 定义矩阵统计量缓存文件路径
+        matrix_stats_cache_file = os.path.join(args.output_dir, f"matrix_stats_{method_suffix}{model_suffix}.json")
+        # [修改点] 加载已有统计量缓存（用于断点续算）
+        matrix_stats = {}
+        if os.path.exists(matrix_stats_cache_file):
+            try:
+                with open(matrix_stats_cache_file, 'r') as f:
+                    matrix_stats = json.load(f)
+                print(f"> 加载矩阵统计量缓存，已有 {len(matrix_stats)} 条记录")
+            except:
+                print("> 警告: 矩阵统计量缓存文件损坏，将重新计算")
 
         similarities = {}
         checkpoint_file = os.path.join(args.output_dir, 'stage2_checkpoint.json')
@@ -494,19 +514,63 @@ def main():
                     continue
                 db_feat = pad_features_to_min_frames(db_feat, min_frames=4)
                 db_feat_device = db_feat.to(device)
+
+                # [修改点] 获取或计算矩阵统计量（最大值、行/列均值、代数均值、调和均值）
+                pair_str = f"{q_id}_{db_id}"
+                if pair_str in matrix_stats:
+                    stats = matrix_stats[pair_str]
+                else:
+                    matrix_path = os.path.join(args.sim_matrices_dir, f"{pair_str}.npy")
+                    if os.path.exists(matrix_path):
+                        try:
+                            matrix = np.load(matrix_path)
+                            max_val = float(np.max(matrix))
+                            row_mean = float(np.mean(np.max(matrix, axis=1)))
+                            col_mean = float(np.mean(np.max(matrix, axis=0)))
+                            # 代数均值（算术平均）
+                            alg_mean = (row_mean + col_mean) / 2.0
+                            # 调和均值
+                            if row_mean + col_mean > 0:
+                                harm_mean = 2.0 * row_mean * col_mean / (row_mean + col_mean + 1e-8)
+                            else:
+                                harm_mean = 0.0
+                            stats = {
+                                'max': max_val,
+                                'row_mean': row_mean,
+                                'col_mean': col_mean,
+                                'alg_mean': alg_mean,
+                                'harm_mean': harm_mean
+                            }
+                        except:
+                            stats = {'max': -1.0, 'row_mean': -1.0, 'col_mean': -1.0,
+                                     'alg_mean': -1.0, 'harm_mean': -1.0}
+                    else:
+                        stats = {'max': -1.0, 'row_mean': -1.0, 'col_mean': -1.0,
+                                 'alg_mean': -1.0, 'harm_mean': -1.0}
+                    matrix_stats[pair_str] = stats
+
                 with torch.no_grad():
                     sim_val = model.calculate_video_similarity(q_feat_device.unsqueeze(0), db_feat_device.unsqueeze(0))
                 similarities[q_id][db_id] = float(sim_val.item())
                 processed_pairs.add(pair_key)
                 pbar.update(1)
 
+                # [修改点] 定期保存检查点和统计量缓存
                 if len(processed_pairs) % 1000 == 0:
                     with open(checkpoint_file, 'w') as f:
                         json.dump({'similarities': similarities, 'processed_pairs': list(processed_pairs)}, f)
+                    with open(matrix_stats_cache_file, 'w') as f:
+                        json.dump(matrix_stats, f)
                 del db_feat_device
             del q_feat_device
             gc.collect()
         pbar.close()
+
+        # [修改点] 最终保存统计量缓存
+        with open(matrix_stats_cache_file, 'w') as f:
+            json.dump(matrix_stats, f)
+        print(f"> 矩阵统计量缓存已保存: {matrix_stats_cache_file}")
+
         stage2_time = time.time() - stage2_start
         print(f"> 阶段2完成，耗时 {stage2_time:.2f}s")
 
@@ -531,6 +595,51 @@ def main():
             return
         with open(sim_file, 'r') as f:
             similarities = json.load(f)
+
+        # [修改点] 加载矩阵统计量缓存，若无则动态计算并保存
+        matrix_stats_cache_file = os.path.join(args.output_dir, f"matrix_stats_{method_suffix}{model_suffix}.json")
+        matrix_stats = {}
+        if os.path.exists(matrix_stats_cache_file):
+            with open(matrix_stats_cache_file, 'r') as f:
+                matrix_stats = json.load(f)
+            print(f"> 加载矩阵统计量缓存，共 {len(matrix_stats)} 条")
+        else:
+            print("> 未找到矩阵统计量缓存，将现场计算并保存...")
+            pbar = tqdm(total=len(query_ids) * len(database_ids), desc="计算矩阵统计量", unit="pair")
+            for q_id in query_ids:
+                for db_id in database_ids:
+                    pair_str = f"{q_id}_{db_id}"
+                    matrix_path = os.path.join(args.sim_matrices_dir, f"{pair_str}.npy")
+                    if os.path.exists(matrix_path):
+                        try:
+                            matrix = np.load(matrix_path)
+                            max_val = float(np.max(matrix))
+                            row_mean = float(np.mean(np.max(matrix, axis=1)))
+                            col_mean = float(np.mean(np.max(matrix, axis=0)))
+                            alg_mean = (row_mean + col_mean) / 2.0
+                            if row_mean + col_mean > 0:
+                                harm_mean = 2.0 * row_mean * col_mean / (row_mean + col_mean + 1e-8)
+                            else:
+                                harm_mean = 0.0
+                            stats = {
+                                'max': max_val,
+                                'row_mean': row_mean,
+                                'col_mean': col_mean,
+                                'alg_mean': alg_mean,
+                                'harm_mean': harm_mean
+                            }
+                        except:
+                            stats = {'max': -1.0, 'row_mean': -1.0, 'col_mean': -1.0,
+                                     'alg_mean': -1.0, 'harm_mean': -1.0}
+                    else:
+                        stats = {'max': -1.0, 'row_mean': -1.0, 'col_mean': -1.0,
+                                 'alg_mean': -1.0, 'harm_mean': -1.0}
+                    matrix_stats[pair_str] = stats
+                    pbar.update(1)
+            pbar.close()
+            with open(matrix_stats_cache_file, 'w') as f:
+                json.dump(matrix_stats, f)
+            print(f"> 矩阵统计量缓存已生成并保存: {matrix_stats_cache_file}")
 
         # 加载数据集对象
         if 'FIVR' in args.dataset:
@@ -560,28 +669,24 @@ def main():
         except Exception as e:
             print(f"> 评估失败: {e}")
 
-        # 二分类检测
-        print(f"\n> 二分类检测评估 (阈值 = {args.detection_threshold})...")
-        y_true, raw_scores = [], []
+        # ---------- 二分类检测评估（基于视频级相似度） ----------
+        print(f"\n> 二分类检测评估 [视频级相似度] (阈值 = {args.detection_threshold})...")
+        y_true_video, raw_scores_video = [], []
         if args.dataset == 'VCDB':
-            # [修改点] 基于 query_to_database 构建正样本标签
             positive_set = {}
             for qid in query_ids:
                 pos_list = dataset.query_to_database.get(qid, [])
                 valid_pos = set(pos_list).intersection(set(database_ids))
                 positive_set[qid] = valid_pos
-
             total_pos_pairs = sum(len(v) for v in positive_set.values())
             print(f"> 正样本视频对总数: {total_pos_pairs}")
-
             for qid in query_ids:
                 pos_videos = positive_set.get(qid, set())
                 for db_id in database_ids:
                     true_label = 1 if db_id in pos_videos else 0
                     score = similarities.get(qid, {}).get(db_id, -1.0)
-                    y_true.append(true_label)
-                    raw_scores.append(score)
-
+                    y_true_video.append(true_label)
+                    raw_scores_video.append(score)
         elif 'FIVR' in args.dataset:
             positive_set = {}
             for q_id in query_ids:
@@ -592,29 +697,153 @@ def main():
                 for db_id in database_ids:
                     true_label = 1 if db_id in positive_set.get(q_id, set()) else 0
                     score = similarities.get(q_id, {}).get(db_id, -1.0)
-                    y_true.append(true_label)
-                    raw_scores.append(score)
-        else:
-            y_true, raw_scores = [], []
+                    y_true_video.append(true_label)
+                    raw_scores_video.append(score)
 
-        if y_true:
-            y_true = np.array(y_true)
-            raw_scores = np.array(raw_scores)
-            pred_labels = (raw_scores >= args.detection_threshold).astype(int)
+        if y_true_video:
+            y_true_video = np.array(y_true_video)
+            raw_scores_video = np.array(raw_scores_video)
+            pred_labels_video = (raw_scores_video >= args.detection_threshold).astype(int)
             from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-            acc = accuracy_score(y_true, pred_labels)
-            prec = precision_score(y_true, pred_labels, zero_division=0)
-            rec = recall_score(y_true, pred_labels, zero_division=0)
-            f1 = f1_score(y_true, pred_labels, zero_division=0)
-            cm = confusion_matrix(y_true, pred_labels)
-            tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
-            print(f"  准确率: {acc:.4f}")
-            print(f"  精确率: {prec:.4f}")
-            print(f"  召回率: {rec:.4f}")
-            print(f"  F1分数: {f1:.4f}")
+            acc_v = accuracy_score(y_true_video, pred_labels_video)
+            prec_v = precision_score(y_true_video, pred_labels_video, zero_division=0)
+            rec_v = recall_score(y_true_video, pred_labels_video, zero_division=0)
+            f1_v = f1_score(y_true_video, pred_labels_video, zero_division=0)
+            cm_v = confusion_matrix(y_true_video, pred_labels_video)
+            tn_v, fp_v, fn_v, tp_v = cm_v.ravel() if cm_v.size == 4 else (0, 0, 0, 0)
+            print(f"  准确率: {acc_v:.4f}")
+            print(f"  精确率: {prec_v:.4f}")
+            print(f"  召回率: {rec_v:.4f}")
+            print(f"  F1分数: {f1_v:.4f}")
             print("  混淆矩阵:")
-            print(f"    TP: {tp:6d}  FP: {fp:6d}")
-            print(f"    FN: {fn:6d}  TN: {tn:6d}")
+            print(f"    TP: {tp_v:6d}  FP: {fp_v:6d}")
+            print(f"    FN: {fn_v:6d}  TN: {tn_v:6d}")
+
+        # [修改点] ---------- 二分类检测评估（基于帧间矩阵最大值） ----------
+        print(f"\n> 二分类检测评估 [帧间矩阵最大值] (阈值 = {args.f2f_threshold})...")
+        y_true_matrix, pred_labels_matrix = [], []
+        missing_matrix = 0
+        for q_id in query_ids:
+            if args.dataset == 'VCDB':
+                pos_set = set(dataset.query_to_database.get(q_id, [])).intersection(set(database_ids))
+            elif 'FIVR' in args.dataset:
+                relevant_dict = dataset.annotation.get(q_id, {})
+                pos_list = sum([relevant_dict.get(label, []) for label in ['ND', 'DS']], [])
+                pos_set = set(pos_list)
+            else:
+                pos_set = set()
+
+            for db_id in database_ids:
+                true_label = 1 if db_id in pos_set else 0
+                y_true_matrix.append(true_label)
+
+                pair_str = f"{q_id}_{db_id}"
+                stats = matrix_stats.get(pair_str, {})
+                max_val = stats.get('max', -1.0)
+                if max_val == -1.0 and not os.path.exists(os.path.join(args.sim_matrices_dir, f"{pair_str}.npy")):
+                    missing_matrix += 1
+                pred = 1 if max_val >= args.f2f_threshold else 0
+                pred_labels_matrix.append(pred)
+
+        if missing_matrix > 0:
+            print(f"  警告: {missing_matrix} 个矩阵缺失，预测置为 0")
+
+        if y_true_matrix:
+            y_true_matrix = np.array(y_true_matrix)
+            pred_labels_matrix = np.array(pred_labels_matrix)
+            acc_m = accuracy_score(y_true_matrix, pred_labels_matrix)
+            prec_m = precision_score(y_true_matrix, pred_labels_matrix, zero_division=0)
+            rec_m = recall_score(y_true_matrix, pred_labels_matrix, zero_division=0)
+            f1_m = f1_score(y_true_matrix, pred_labels_matrix, zero_division=0)
+            cm_m = confusion_matrix(y_true_matrix, pred_labels_matrix)
+            tn_m, fp_m, fn_m, tp_m = cm_m.ravel() if cm_m.size == 4 else (0, 0, 0, 0)
+            print(f"  准确率: {acc_m:.4f}")
+            print(f"  精确率: {prec_m:.4f}")
+            print(f"  召回率: {rec_m:.4f}")
+            print(f"  F1分数: {f1_m:.4f}")
+            print("  混淆矩阵:")
+            print(f"    TP: {tp_m:6d}  FP: {fp_m:6d}")
+            print(f"    FN: {fn_m:6d}  TN: {tn_m:6d}")
+
+        # [修改点] ---------- 二分类检测评估（基于代数均值） ----------
+        print(f"\n> 二分类检测评估 [代数均值] (阈值 = {args.algebraic_threshold})...")
+        y_true_alg, pred_labels_alg = [], []
+        for q_id in query_ids:
+            if args.dataset == 'VCDB':
+                pos_set = set(dataset.query_to_database.get(q_id, [])).intersection(set(database_ids))
+            elif 'FIVR' in args.dataset:
+                relevant_dict = dataset.annotation.get(q_id, {})
+                pos_list = sum([relevant_dict.get(label, []) for label in ['ND', 'DS']], [])
+                pos_set = set(pos_list)
+            else:
+                pos_set = set()
+
+            for db_id in database_ids:
+                true_label = 1 if db_id in pos_set else 0
+                y_true_alg.append(true_label)
+
+                pair_str = f"{q_id}_{db_id}"
+                stats = matrix_stats.get(pair_str, {})
+                alg_mean = stats.get('alg_mean', -1.0)
+                pred = 1 if alg_mean >= args.algebraic_threshold else 0
+                pred_labels_alg.append(pred)
+
+        if y_true_alg:
+            y_true_alg = np.array(y_true_alg)
+            pred_labels_alg = np.array(pred_labels_alg)
+            acc_alg = accuracy_score(y_true_alg, pred_labels_alg)
+            prec_alg = precision_score(y_true_alg, pred_labels_alg, zero_division=0)
+            rec_alg = recall_score(y_true_alg, pred_labels_alg, zero_division=0)
+            f1_alg = f1_score(y_true_alg, pred_labels_alg, zero_division=0)
+            cm_alg = confusion_matrix(y_true_alg, pred_labels_alg)
+            tn_alg, fp_alg, fn_alg, tp_alg = cm_alg.ravel() if cm_alg.size == 4 else (0, 0, 0, 0)
+            print(f"  准确率: {acc_alg:.4f}")
+            print(f"  精确率: {prec_alg:.4f}")
+            print(f"  召回率: {rec_alg:.4f}")
+            print(f"  F1分数: {f1_alg:.4f}")
+            print("  混淆矩阵:")
+            print(f"    TP: {tp_alg:6d}  FP: {fp_alg:6d}")
+            print(f"    FN: {fn_alg:6d}  TN: {tn_alg:6d}")
+
+        # [修改点] ---------- 二分类检测评估（基于调和均值） ----------
+        print(f"\n> 二分类检测评估 [调和均值] (阈值 = {args.harmonic_threshold})...")
+        y_true_harm, pred_labels_harm = [], []
+        for q_id in query_ids:
+            if args.dataset == 'VCDB':
+                pos_set = set(dataset.query_to_database.get(q_id, [])).intersection(set(database_ids))
+            elif 'FIVR' in args.dataset:
+                relevant_dict = dataset.annotation.get(q_id, {})
+                pos_list = sum([relevant_dict.get(label, []) for label in ['ND', 'DS']], [])
+                pos_set = set(pos_list)
+            else:
+                pos_set = set()
+
+            for db_id in database_ids:
+                true_label = 1 if db_id in pos_set else 0
+                y_true_harm.append(true_label)
+
+                pair_str = f"{q_id}_{db_id}"
+                stats = matrix_stats.get(pair_str, {})
+                harm_mean = stats.get('harm_mean', -1.0)
+                pred = 1 if harm_mean >= args.harmonic_threshold else 0
+                pred_labels_harm.append(pred)
+
+        if y_true_harm:
+            y_true_harm = np.array(y_true_harm)
+            pred_labels_harm = np.array(pred_labels_harm)
+            acc_harm = accuracy_score(y_true_harm, pred_labels_harm)
+            prec_harm = precision_score(y_true_harm, pred_labels_harm, zero_division=0)
+            rec_harm = recall_score(y_true_harm, pred_labels_harm, zero_division=0)
+            f1_harm = f1_score(y_true_harm, pred_labels_harm, zero_division=0)
+            cm_harm = confusion_matrix(y_true_harm, pred_labels_harm)
+            tn_harm, fp_harm, fn_harm, tp_harm = cm_harm.ravel() if cm_harm.size == 4 else (0, 0, 0, 0)
+            print(f"  准确率: {acc_harm:.4f}")
+            print(f"  精确率: {prec_harm:.4f}")
+            print(f"  召回率: {rec_harm:.4f}")
+            print(f"  F1分数: {f1_harm:.4f}")
+            print("  混淆矩阵:")
+            print(f"    TP: {tp_harm:6d}  FP: {fp_harm:6d}")
+            print(f"    FN: {fn_harm:6d}  TN: {tn_harm:6d}")
 
         stage3_time = time.time() - stage3_start
         print(f"> 阶段3完成，耗时 {stage3_time:.2f}s")

@@ -208,6 +208,58 @@ def extract_keyframes(video_path, video_id, frames_dir, method='iframe',
 
         frame_indices = i_frame_indices
 
+    elif method == 'shot':
+        from shot_based_keyframes import extract_keyframes as shot_extract
+        # 参数设置：镜头检测阈值、每镜头最大关键帧数
+        shot_threshold = 0.5  # 可后续作为参数传入
+        max_per_shot = 2
+        save_dir = os.path.join(frames_dir, video_id)
+        os.makedirs(save_dir, exist_ok=True)
+
+        try:
+            # 调用镜头检测函数
+            indices = shot_extract(video_path, save_dir,
+                                   threshold=shot_threshold,
+                                   max_keyframes_per_shot=max_per_shot)
+        except Exception as e:
+            sys.stderr.write(f"[{video_id}] shot_extract 失败: {e}\n")
+            if reader: reader.close()
+            return None, None, None, None
+
+        # 验证索引
+        valid_indices = [idx for idx in indices if idx < total_frames]
+        if not valid_indices:
+            sys.stderr.write(f"[{video_id}] shot_extract 无有效帧\n")
+            if reader: reader.close()
+            return None, None, None, None
+        frame_indices = valid_indices
+
+        # 读取帧（沿用已有逻辑）
+        try:
+            if use_decord:
+                frames_np = reader.get_frames(frame_indices)
+                if frames_np.size == 0:
+                    reader.close()
+                    return None, None, None, None
+                for i, idx in enumerate(frame_indices):
+                    img = frames_np[i]
+                    img_path = os.path.join(save_dir, f"{idx:06d}.jpg")
+                    Image.fromarray(img).save(img_path, quality=90)
+                frames = [frames_np[i] for i in range(len(frame_indices))]
+                saved_indices = frame_indices
+            else:
+                # OpenCV 读取逻辑...
+                pass
+            # 保存元数据
+            with open(os.path.join(save_dir, 'indices.json'), 'w') as f:
+                json.dump(saved_indices, f)
+            with open(os.path.join(save_dir, 'info.json'), 'w') as f:
+                json.dump({'fps': fps, 'total_frames': total_frames}, f)
+            return saved_indices, frames, fps, total_frames
+        except Exception as e:
+            sys.stderr.write(f"[{video_id}] 读取帧异常: {e}\n")
+            return None, None, None, None
+
     elif method == '2s':
         step = max(1, int(2 * fps))
         frame_indices = list(range(0, total_frames, step))
